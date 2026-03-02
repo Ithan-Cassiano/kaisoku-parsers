@@ -141,7 +141,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 		val maxPageChapterSelect = doc.select(".pagination .page-item a")
 		var maxPageChapter = 1
 		if (!maxPageChapterSelect.isNullOrEmpty()) {
-			maxPageChapterSelect.map {
+			maxPageChapterSelect.forEach {
 				val i = it.attr("href").substringAfterLast("=").toInt()
 				if (i > maxPageChapter) {
 					maxPageChapter = i
@@ -170,7 +170,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 					coroutineScope {
 						val result = ArrayList(parseChapters(doc))
 						result.ensureCapacity(result.size * maxPageChapter)
-						(2..maxPageChapter).map { i ->
+						(2 downTo maxPageChapter).map { i ->
 							async {
 								loadChapters(mangaUrl, i)
 							}
@@ -187,53 +187,44 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 		return parseChapters(webClient.httpGet("$baseUrl?page=$page").parseHtml().body())
 	}
 
-	private val dateFormat = SimpleDateFormat("yyyy-MM-dd hh:mm:ss", Locale.getDefault())
+	private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", sourceLocale)
 
 	private fun parseChapters(root: Element): List<MangaChapter> {
-		// Try current website structure first (enhanced-chapters-grid)
-		val chapters = root.select("div.enhanced-chapters-grid a.chapter-link").ifEmpty {
-			// Fallback to potential alternative structures
-			root.select("div.chapter-card a").ifEmpty {
-				root.select("div.eplister ul a").ifEmpty {
-					root.select("#chapter-contact .eplister ul li a")
+		val chapters = root.select("#chaptersContainer .chapter-card").ifEmpty {
+			root.select("div.enhanced-chapters-grid a.chapter-link").ifEmpty {
+				root.select("div.chapter-card a").ifEmpty {
+					root.select("div.eplister ul a").ifEmpty {
+						root.select("#chapter-contact .eplister ul li a")
+					}
 				}
 			}
 		}
 
 		return chapters.map { element ->
-			val url = element.attrAsRelativeUrl("href")
-
-			// Extract chapter number and title from current structure
-			val chpNum = element.select(".chapter-number").text()
-			val chpTitle = element.select(".chapter-title").text()
-
-			// Fallback to old structure if current selectors are empty
-			val finalChpNum = chpNum.ifEmpty {
+			val link = if (element.tagName() == "a") element else element.selectFirstOrThrow("a")
+			val url = link.attrAsRelativeUrl("href")
+			val chapterNumberText = element.select(".chapter-number").text().ifEmpty {
 				element.select("div.chapter-info div.chapter-number").text().ifEmpty {
 					element.select("div.epl-num").text()
 				}
 			}
-			val finalChpTitle = chpTitle.ifEmpty {
+			val chapterTitleText = element.select(".chapter-title").text().ifEmpty {
 				element.select("div.chapter-info div.chapter-title").text().ifEmpty {
 					element.select("div.epl-title").text()
 				}
 			}
-
 			val title = when {
-				finalChpNum.isNotBlank() -> "$finalChpNum - $finalChpTitle"
-				else -> finalChpTitle
+				chapterNumberText.isNotBlank() && chapterTitleText.isNotBlank() -> "$chapterNumberText - $chapterTitleText"
+				chapterTitleText.isNotBlank() -> chapterTitleText
+				else -> chapterNumberText
 			}
-
-			// Extract date from current structure, fallback to old structures
-			val dateText = element.select(".chapter-date").text().ifEmpty {
+			val dateText = element.select(".chapter-date span, .chapter-date").text().ifEmpty {
 				element.select("div.chapter-info div.chapter-date").text().ifEmpty {
 					element.select("div.epl-date").text()
 				}
-			}.replace(Regex("^\\s*\\S+\\s+"), "") // Remove icon text if present
-
-			// Try to extract chapter number from data attribute or URL
-			val chapterNumber = element.select("div.chapter-card").attr("data-number").toFloatOrNull()
-				?: finalChpNum.filter { it.isDigit() || it == '.' }.toFloatOrNull()
+			}.replace(Regex("^\\s*\\S+\\s+"), "")
+			val chapterNumber = element.attr("data-number").toFloatOrNull()
+				?: chapterNumberText.filter { it.isDigit() || it == '.' }.toFloatOrNull()
 				?: url.substringAfterLast('/').toFloatOrNull()
 				?: 0f
 
@@ -244,7 +235,7 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 				volume = 0,
 				url = url,
 				scanlator = null,
-				uploadDate = dateFormat.parseSafe(dateText),
+				uploadDate = parseChapterDate(dateText),
 				branch = null,
 				source = source,
 			)
@@ -266,6 +257,52 @@ internal class TeamXNovel(context: MangaLoaderContext) :
 				preview = null,
 				source = source,
 			)
+		}
+	}
+
+	private fun parseChapterDate(dateText: String?): Long {
+		if (dateText == null) return 0
+
+		val relativeTimePattern = Regex("(\\d+)\\s*(minute|minutes|hour|hours|day|days|week|weeks|year|years)", RegexOption.IGNORE_CASE)
+		val absoluteTimePattern = Regex("(\\d{2}-\\d{2}-\\d{4})")
+
+		return when {
+			dateText.contains("minute", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val minutes = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - minutes * 60 * 1000
+			}
+
+			dateText.contains("hour", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val hours = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - hours * 3600 * 1000
+			}
+
+			dateText.contains("day", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val days = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - days * 86400 * 1000
+			}
+
+			dateText.contains("week", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val weeks = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - weeks * 7 * 86400 * 1000
+			}
+
+			dateText.contains("year", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val years = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - years * 365L * 86400 * 1000
+			}
+
+			absoluteTimePattern.matches(dateText) -> {
+				val formatter = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
+				formatter.parseSafe(dateText)
+			}
+
+			else -> dateFormat.parseSafe(dateText)
 		}
 	}
 }
