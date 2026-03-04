@@ -19,8 +19,12 @@ internal class KuroNeko(context: MangaLoaderContext) : PagedMangaParser(context,
 
 	override val configKeyDomain = ConfigKey.Domain("vi-hentai.moe", "vi-hentai.org")
 
-	private val pagesRequestMutex = Mutex()
-	private var lastPagesRequestTime = 0L
+	override val webClient = OkHttpWebClient(
+		context.httpClient.newBuilder()
+			.rateLimit(14, 60.seconds)
+			.build(),
+		source,
+	)
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
