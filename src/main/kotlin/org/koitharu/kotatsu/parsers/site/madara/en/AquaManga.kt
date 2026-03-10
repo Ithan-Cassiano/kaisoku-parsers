@@ -11,7 +11,6 @@ import kotlin.random.Random
 @MangaSourceParser("AQUAMANGA", "AquaManga", "en")
 internal class AquaManga(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.AQUAMANGA, "aquareader.net", 20) {
-
 	override val withoutAjax = true
 	override val stylePage = ""
 
