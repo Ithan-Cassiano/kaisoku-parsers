@@ -344,14 +344,14 @@ internal abstract class MadaraParser(
 				payload["vars[tax_query][2][terms][]"] = filter.year.toString()
 			}
 
-			// Support author
-			//  filter.author.let {
-			//	payload["vars[tax_query][3][taxonomy]"] = "wp-manga-author"
-			//	payload["vars[tax_query][3][field]"] = "name"
-			//	payload["vars[tax_query][3][terms][0]"] = filter.author
-			//	payload["vars[tax_query][3][operator]"] = "IN"
-			//}
-
+			if (!filter.author.isNullOrEmpty()) {
+				filter.author.let {
+					payload["vars[tax_query][3][taxonomy]"] = "wp-manga-author"
+					payload["vars[tax_query][3][field]"] = "name"
+					payload["vars[tax_query][3][terms][0]"] = filter.author
+					payload["vars[tax_query][3][operator]"] = "IN"
+				}
+			}
 
 			// Support artist
 			//  filter.artist.let {
