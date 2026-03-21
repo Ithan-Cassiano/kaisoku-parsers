@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.madara.en
 
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -56,7 +58,7 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		if (!filter.query.isNullOrEmpty()) {
-			return if (page == 1) {
+			return if (page <= 1) {
 				searchByAjax(filter.query)
 			} else {
 				emptyList()
@@ -140,12 +142,18 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 
 	private suspend fun searchByAjax(query: String): List<Manga> {
 		val response = webClient.httpPost(
-			url = "https://$domain/wp-admin/admin-ajax.php",
-			form = mapOf(
-				"action" to "live_search",
-				"security" to getLiveSearchNonce(),
-				"search_query" to query,
-			),
+			url = "https://$domain/wp-admin/admin-ajax.php".toHttpUrl(),
+			payload = buildString {
+				append("action=live_search")
+				append("&security=")
+				append(getLiveSearchNonce())
+				append("&search_query=")
+				append(query.urlEncoded())
+			},
+			extraHeaders = Headers.Builder()
+				.add("Referer", "https://$domain/")
+				.add("X-Requested-With", "XMLHttpRequest")
+				.build(),
 		).parseRaw()
 		val results = JSONObject(response).optJSONArray("results") ?: return emptyList()
 		return buildList(results.length()) {
@@ -161,7 +169,11 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 	private suspend fun getLiveSearchNonce(): String {
 		liveSearchNonce?.let { return it }
 		val html = webClient.httpGet("https://$domain/").parseRaw()
-		val nonce = LIVE_SEARCH_NONCE_REGEX.find(html)?.groupValues?.getOrNull(1)?.nullIfEmpty()
+		val nonceJson = LIVE_SEARCH_DATA_REGEX.find(html)?.groupValues?.getOrNull(1)
+		val nonce = nonceJson
+			?.let(::JSONObject)
+			?.optString("nonce")
+			?.nullIfEmpty()
 			?: error("Missing live search nonce")
 		liveSearchNonce = nonce
 		return nonce
@@ -267,6 +279,6 @@ internal class PhiliaScans(context: MangaLoaderContext) :
 
 	private companion object {
 		private val CHAPTER_NUMBER_REGEX = Regex("""(\d+(?:\.\d+)?)""")
-		private val LIVE_SEARCH_NONCE_REGEX = Regex("""var\s+liveSearchData\s*=\s*\{"ajaxurl":"[^"]+","nonce":"([^"]+)""")
+		private val LIVE_SEARCH_DATA_REGEX = Regex("""var\s+liveSearchData\s*=\s*(\{.*?\});""")
 	}
 }

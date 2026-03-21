@@ -510,7 +510,9 @@ internal abstract class InitMangaParser(
 	}
 
 	private fun Element.extractSeriesTitle(link: Element): String {
-		return selectFirst("h3 a, h3, h4 a, h4, strong.slider-title, strong.uk-h2")
+		return selectFirst(
+			"h2 a, h2, h3 a, h3, h4 a, h4, a.uk-link-heading, strong.slider-title, strong.uk-h2",
+		)
 			?.text()
 			?.trim()
 			?.nullIfEmpty()
