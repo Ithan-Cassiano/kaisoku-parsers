@@ -6,10 +6,13 @@ PUSH=false
 TARGET_BRANCH="master"
 SOURCE_FILTER=""
 
+BASELINE_SPECS=(
+  "upstream|https://github.com/KotatsuApp/kotatsu-parsers.git|master"
+)
+
 SOURCE_SPECS=(
-  "upstream|https://github.com/KotatsuApp/kotatsu-parsers.git|master||auto"
   "redo|https://github.com/Kotatsu-Redo/kotatsu-parsers-redo.git|master|upstream|auto"
-  "yumemi|https://github.com/YakaTeam/kotatsu-parsers.git|master|upstream|manual"
+  "yaka|https://github.com/YakaTeam/kotatsu-parsers.git|master|upstream|manual"
   "futon|https://github.com/AppFuton/futon-parsers.git|master|upstream|manual"
 )
 
@@ -33,7 +36,7 @@ Options:
   --push                  Push target branch to origin after successful apply.
   --branch <name>         Target branch to sync (default: master).
   --sources <csv>         Comma-separated source remotes to include.
-                          Available: upstream,redo,yumemi,futon
+                          Available: redo,yaka,futon
   -h, --help              Show this help.
 EOF
 }
@@ -373,6 +376,18 @@ declare -A SOURCE_REFS
 declare -A SOURCE_BRANCHES
 declare -A SOURCE_BASES
 declare -A SOURCE_MODES
+
+for spec in "${BASELINE_SPECS[@]}"; do
+  IFS='|' read -r name url branch <<<"${spec}"
+  ensure_remote "${name}" "${url}"
+  log "Fetching baseline ${name}/${branch}..."
+  git fetch --prune "${name}" "${branch}"
+
+  SOURCE_REFS["${name}"]="${name}/${branch}"
+  SOURCE_BRANCHES["${name}"]="${branch}"
+  SOURCE_BASES["${name}"]=""
+  SOURCE_MODES["${name}"]="baseline"
+done
 
 for spec in "${SOURCE_SPECS[@]}"; do
   IFS='|' read -r name url branch base_name mode <<<"${spec}"
