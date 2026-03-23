@@ -329,7 +329,7 @@ internal abstract class MangaBallParser(
 			mapOf("title_id" to titleId),
 		).parseJson()
 		val containers = json.getJSONArray("ALL_CHAPTERS")
-		val chapters = LinkedHashMap<String, MangaChapter>(containers.length())
+		val chapterCandidates = ArrayList<ChapterCandidate>(containers.length())
 		for (i in 0 until containers.length()) {
 			val container = containers.getJSONObject(i)
 			val number = container.optDouble("number_float", 0.0).toFloat()
@@ -365,14 +365,31 @@ internal abstract class MangaBallParser(
 					branch = language.takeIf { siteLanguages.size > 1 },
 					source = source,
 				)
-				val key = "$language|$volume|$number"
-				val existing = chapters[key]
-				if (existing == null || shouldReplaceChapter(existing, chapter)) {
-					chapters[key] = chapter
-				}
+				chapterCandidates += ChapterCandidate(language = language, chapter = chapter)
 			}
 		}
-		return chapters.values.toList().reversed()
+		val scanlatorCounts = chapterCandidates.groupingBy {
+			"${it.language}|${it.chapter.scanlator.orEmpty()}"
+		}.eachCount()
+		return chapterCandidates
+			.groupBy { "${it.language}|${it.chapter.number}" }
+			.values
+			.mapNotNull { candidates ->
+				candidates.maxWithOrNull { left, right ->
+					compareChapterCandidates(
+						left = left,
+						right = right,
+						scanlatorCounts = scanlatorCounts,
+					)
+				}?.chapter
+			}
+			.sortedWith(
+				compareBy<MangaChapter> { it.number }
+					.thenBy { if (it.volume > 0) 1 else 0 }
+					.thenBy { it.uploadDate }
+					.thenBy { it.branch.orEmpty() }
+					.thenBy { it.title.orEmpty() },
+			)
 	}
 
 	private fun buildChapterTitle(numberText: String, volume: Int, rawName: String): String {
@@ -411,16 +428,30 @@ internal abstract class MangaBallParser(
 		}
 	}
 
-	private fun shouldReplaceChapter(current: MangaChapter, candidate: MangaChapter): Boolean {
-		val currentTitle = current.title.orEmpty()
-		val candidateTitle = candidate.title.orEmpty()
-		if (candidateTitle.length != currentTitle.length) {
-			return candidateTitle.length < currentTitle.length
+	private fun compareChapterCandidates(
+		left: ChapterCandidate,
+		right: ChapterCandidate,
+		scanlatorCounts: Map<String, Int>,
+	): Int {
+		val leftChapter = left.chapter
+		val rightChapter = right.chapter
+		val leftScore = scanlatorCounts["${left.language}|${leftChapter.scanlator.orEmpty()}"] ?: 0
+		val rightScore = scanlatorCounts["${right.language}|${rightChapter.scanlator.orEmpty()}"] ?: 0
+		if (leftScore != rightScore) {
+			return leftScore.compareTo(rightScore)
 		}
-		if (candidate.uploadDate != current.uploadDate) {
-			return candidate.uploadDate > current.uploadDate
+		if ((leftChapter.volume > 0) != (rightChapter.volume > 0)) {
+			return if (leftChapter.volume == 0) 1 else -1
 		}
-		return candidate.id < current.id
+		val leftTitle = leftChapter.title.orEmpty()
+		val rightTitle = rightChapter.title.orEmpty()
+		if (leftTitle.length != rightTitle.length) {
+			return rightTitle.length.compareTo(leftTitle.length)
+		}
+		if (leftChapter.uploadDate != rightChapter.uploadDate) {
+			return leftChapter.uploadDate.compareTo(rightChapter.uploadDate)
+		}
+		return rightChapter.id.compareTo(leftChapter.id)
 	}
 
 	private suspend fun resolveSearchUrl(query: String): List<Manga> {
@@ -565,6 +596,11 @@ internal abstract class MangaBallParser(
 		Demographic.JOSEI -> "josei"
 		else -> "any"
 	}
+
+	private data class ChapterCandidate(
+		val language: String,
+		val chapter: MangaChapter,
+	)
 
 	companion object {
 

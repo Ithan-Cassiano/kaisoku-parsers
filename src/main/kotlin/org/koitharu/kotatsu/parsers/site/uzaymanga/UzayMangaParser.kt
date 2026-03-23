@@ -435,14 +435,14 @@ internal abstract class UzayMangaParser(
 		val response = runCatching { webClient.httpGet(url, extraHeaders = siteHeaders()) }.getOrNull() ?: return null
 		return response.use { res ->
 			val doc = runCatching { res.parseHtml() }.getOrNull() ?: return HttpDocumentResult.Failed
-			if (hasValidUzayContent(doc)) {
-				return HttpDocumentResult.Success(doc)
-			}
 			if (isCloudflareChallengePage(doc)) {
 				return HttpDocumentResult.CloudflareChallenge
 			}
 			if (isShieldVerificationPage(doc)) {
 				return HttpDocumentResult.SecondaryVerification
+			}
+			if (hasValidUzayContent(doc)) {
+				return HttpDocumentResult.Success(doc)
 			}
 			HttpDocumentResult.Success(doc)
 		}
@@ -455,11 +455,14 @@ internal abstract class UzayMangaParser(
 			?: return null
 
 		val doc = Jsoup.parse(html, url)
-		if (hasValidUzayContent(doc)) {
-			return doc
+		if (isCloudflareChallengePage(doc)) {
+			context.requestBrowserAction(this, url)
 		}
 		if (isShieldVerificationPage(doc)) {
 			return null
+		}
+		if (hasValidUzayContent(doc)) {
+			return doc
 		}
 		return doc
 	}
@@ -508,6 +511,12 @@ internal abstract class UzayMangaParser(
 
 	private fun isCloudflareChallengePage(doc: Document): Boolean {
 		if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
+		if (doc.selectFirst("iframe[src*=challenge-platform]") != null) return true
+		if (doc.selectFirst("script[src*=challenges.cloudflare.com]") != null) return true
+		if (doc.selectFirst("iframe[src*=challenges.cloudflare.com]") != null) return true
+		if (doc.selectFirst(".cf-turnstile") != null) return true
+		if (doc.selectFirst("iframe[title*=Cloudflare]") != null) return true
+		if (doc.selectFirst("input[name=cf-turnstile-response]") != null) return true
 		if (doc.getElementById("challenge-error-title") != null) return true
 		if (doc.getElementById("challenge-error-text") != null) return true
 		if (doc.selectFirst("form[action*=__cf_chl]") != null) return true
@@ -520,7 +529,10 @@ internal abstract class UzayMangaParser(
 			(lower.contains("checking your browser") && lower.contains("cloudflare")) ||
 			lower.contains("cf-chl-opt") ||
 			lower.contains("cf-browser-verification") ||
-			lower.contains("/cdn-cgi/challenge-platform/")
+			lower.contains("/cdn-cgi/challenge-platform/") ||
+			lower.contains("challenges.cloudflare.com") ||
+			lower.contains("cf-turnstile") ||
+			lower.contains("turnstile") && lower.contains("cloudflare")
 	}
 
 	private fun hasValidUzayContent(doc: Document): Boolean {
@@ -566,6 +578,17 @@ internal abstract class UzayMangaParser(
 
 					const isVerificationPage = () => {
 						const html = (document.documentElement ? document.documentElement.outerHTML : '').toLowerCase();
+						const isCloudflare = document.querySelector('script[src*="challenge-platform"],iframe[src*="challenge-platform"],script[src*="challenges.cloudflare.com"],iframe[src*="challenges.cloudflare.com"],.cf-turnstile,input[name="cf-turnstile-response"],iframe[title*="Cloudflare"]') !== null ||
+							((html.includes('just a moment') || html.includes('checking your browser')) && html.includes('cloudflare')) ||
+							html.includes('cf-chl-opt') ||
+							html.includes('cf-browser-verification') ||
+							html.includes('/cdn-cgi/challenge-platform/') ||
+							html.includes('challenges.cloudflare.com') ||
+							html.includes('cf-turnstile') ||
+							(html.includes('turnstile') && html.includes('cloudflare'));
+						if (isCloudflare) {
+							return true;
+						}
 						return document.querySelector('#container.verified') !== null ||
 							html.includes('verification complete') ||
 							html.includes('protected by waf security shield') ||

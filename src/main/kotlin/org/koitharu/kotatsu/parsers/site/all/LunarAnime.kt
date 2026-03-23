@@ -64,13 +64,9 @@ internal class LunarAnime(context: MangaLoaderContext) :
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
 		return if (request.url.host.equals(CDN_HOST, ignoreCase = true)) {
-			val chapterReferer = request.url.fragment
-				?.takeIf { it.startsWith("/manga/") }
-				?.let { "https://$domain$it" }
-				?: "https://$domain/"
 			chain.proceed(
 				request.newBuilder()
-					.header("Referer", chapterReferer)
+					.header("Referer", "https://$domain/")
 					.header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
 					.build(),
 			)
@@ -137,10 +133,10 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		val data = root.optJSONObject("data")
 		val imageUrls = when {
 			data == null -> emptyList()
-			data.optJSONArray("images") != null -> jsonArrayToStrings(data.optJSONArray("images"))
 			data.optString("session_data").isNotBlank() && !secretKey.isNullOrBlank() -> {
 				decryptSessionData(data.optString("session_data"), secretKey)
 			}
+			data.optJSONArray("images") != null -> jsonArrayToStrings(data.optJSONArray("images"))
 			else -> {
 				val fallback = root.optJSONArray("images")
 					?: root.optJSONArray("chapter_images")
@@ -151,7 +147,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		return imageUrls.mapIndexed { index, imageUrl ->
 			MangaPage(
 				id = generateUid("${chapter.url}#$index"),
-				url = "$imageUrl#${chapter.url}",
+				url = imageUrl,
 				preview = null,
 				source = source,
 			)
