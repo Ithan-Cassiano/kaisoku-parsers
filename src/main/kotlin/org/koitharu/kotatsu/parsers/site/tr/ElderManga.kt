@@ -221,16 +221,13 @@ internal class ElderManga(context: MangaLoaderContext):
         val response = runCatching { webClient.httpGet(url) }.getOrNull() ?: return null
         return response.use { res ->
             val doc = runCatching { res.parseHtml() }.getOrNull() ?: return HttpDocumentResult.Failed
-            if (isCloudflareChallengePage(doc)) {
-                return HttpDocumentResult.CloudflareChallenge
+            if (hasValidElderContent(doc)) {
+                return HttpDocumentResult.Success(doc)
             }
             if (isShieldVerificationPage(doc)) {
                 return HttpDocumentResult.SecondaryVerification
             }
-            if (hasValidElderContent(doc)) {
-                return HttpDocumentResult.Success(doc)
-            }
-            HttpDocumentResult.Success(doc)
+            HttpDocumentResult.CloudflareChallenge
         }
     }
 
@@ -241,16 +238,14 @@ internal class ElderManga(context: MangaLoaderContext):
             ?: return null
 
         val doc = Jsoup.parse(html, url)
-        if (isCloudflareChallengePage(doc)) {
-            context.requestBrowserAction(this, url)
+        if (hasValidElderContent(doc)) {
+            return doc
         }
         if (isShieldVerificationPage(doc)) {
             return null
         }
-        if (hasValidElderContent(doc)) {
-            return doc
-        }
-        return doc
+        context.requestBrowserAction(this, url)
+        return null
     }
 
     private fun decodeWebViewHtml(raw: String): String {
@@ -310,7 +305,9 @@ internal class ElderManga(context: MangaLoaderContext):
     }
 
     private fun hasValidElderContent(doc: Document): Boolean {
-        return doc.select("section[aria-label='series area'] .card").isNotEmpty() ||
+        val hasDirectoryCards = doc.select("section[aria-label='series area'] .card").isNotEmpty() ||
+            doc.select("section[aria-label='series area'] a[href*='/manga/'] h2").isNotEmpty()
+        return hasDirectoryCards ||
             doc.select("div.list-episode a").isNotEmpty() ||
             doc.select("#content h1").isNotEmpty() ||
             doc.select("a[href*='search?categories=']").isNotEmpty()
@@ -331,6 +328,7 @@ internal class ElderManga(context: MangaLoaderContext):
                         return false;
                     }
                     return document.querySelector('section[aria-label="series area"] .card') !== null ||
+                        document.querySelector('section[aria-label="series area"] a[href*="/manga/"] h2') !== null ||
                         document.querySelector('div.list-episode a') !== null ||
                         document.querySelector('#content h1') !== null ||
                         document.querySelector('a[href*="search?categories="]') !== null;
@@ -355,14 +353,14 @@ internal class ElderManga(context: MangaLoaderContext):
                                 lower.includes('cf-chl-opt');
                             return hasChallengeScript || hasChallengeTitle || hasChallengeText || hasChallengeForm || hasChallengeTextSignal;
                         };
-                        const isCloudflare = !hasElderContent() && (challengeDetected() ||
-                            title.includes('access denied') ||
-                            title.includes('just a moment') ||
-                            html.includes('cf-browser-verification') ||
-                            (html.includes('/cdn-cgi/challenge-platform/') &&
-                                (html.includes('enable javascript and cookies to continue') || html.includes('window._cf_chl_opt'))) ||
-                            html.includes('form action="/cdn-cgi/challenge-platform/') ||
-                            html.includes('form action="/cdn-cgi/l/chk_captcha'));
+                        const isCloudflare = !hasElderContent() && !(
+                            document.querySelector('#container.verified') !== null ||
+                            html.includes('verification complete') ||
+                            html.includes('protected by waf security shield') ||
+                            html.includes('access granted!') ||
+                            html.includes('computing challenge') ||
+                            html.includes('solving proof of work')
+                        );
                         if (isCloudflare) {
                             return true;
                         }
