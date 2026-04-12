@@ -16,9 +16,12 @@ internal class HentaiCube(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.HENTAICUBE, "hentaicube.xyz") {
 
 	override val datePattern = "dd/MM/yyyy"
-	override val postReq = true
 	override val authorSearchSupported = true
 	override val postDataReq = "action=manga_views&manga="
+
+	override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
+		.add("Origin", "https://$domain")
+		.build()
 
 	private val availableTags = suspendLazy(initializer = ::fetchTags)
 
@@ -127,6 +130,14 @@ internal class HentaiCube(context: MangaLoaderContext) :
 		return allTags.find {
 			it.title.trim().equals(title, ignoreCase = true) // try to search with trim
 		}
+	}
+
+	override suspend fun getDetails(manga: Manga): Manga {
+		val result = super.getDetails(manga)
+		val doc = webClient.httpGet(result.publicUrl).parseHtml()
+		return result.copy(
+			title = doc.selectFirst("h1")?.ownText() ?: result.title,
+		)
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {

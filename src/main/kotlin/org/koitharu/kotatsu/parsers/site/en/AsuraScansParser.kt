@@ -5,15 +5,32 @@ import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
-import org.koitharu.kotatsu.parsers.model.*
+import org.koitharu.kotatsu.parsers.model.ContentType
+import org.koitharu.kotatsu.parsers.model.ContentRating
+import org.koitharu.kotatsu.parsers.model.Manga
+import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
+import org.koitharu.kotatsu.parsers.model.MangaListFilterCapabilities
+import org.koitharu.kotatsu.parsers.model.MangaListFilterOptions
+import org.koitharu.kotatsu.parsers.model.MangaPage
+import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaState
+import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
+import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.model.WordSet
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.util.json.toJSONArrayOrNull
-import org.koitharu.kotatsu.parsers.util.json.toJSONObjectOrNull
+import org.koitharu.kotatsu.parsers.util.json.*
+import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.DateFormat
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Calendar
+import java.util.EnumSet
+import java.util.LinkedHashMap
+import java.util.Locale
+import java.util.TreeMap
 
-@MangaSourceParser("ASURASCANS", "AsuraComic", "en")
+@MangaSourceParser("ASURASCANS", "AsuraScans", "en")
 internal class AsuraScansParser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.ASURASCANS, pageSize = 20) {
 
@@ -25,11 +42,16 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 	}
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
-		SortOrder.RATING,
 		SortOrder.UPDATED,
+		SortOrder.UPDATED_ASC,
 		SortOrder.POPULARITY,
+		SortOrder.POPULARITY_ASC,
+		SortOrder.RATING,
+		SortOrder.RATING_ASC,
 		SortOrder.ALPHABETICAL_DESC,
 		SortOrder.ALPHABETICAL,
+		SortOrder.NEWEST,
+		SortOrder.NEWEST_ASC,
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
@@ -37,16 +59,16 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 			isMultipleTagsSupported = true,
 			isSearchSupported = true,
 			isSearchWithFiltersSupported = true,
+			isAuthorSearchSupported = true,
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = availableTags,
+		availableTags = availableTags.get(),
 		availableStates = EnumSet.of(
 			MangaState.ONGOING,
 			MangaState.FINISHED,
 			MangaState.ABANDONED,
 			MangaState.PAUSED,
-			MangaState.UPCOMING,
 		),
 		availableContentTypes = EnumSet.of(
 			ContentType.MANGA,
@@ -92,17 +114,17 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 				)
 			}
 
-			addQueryParameter(
-				"sort",
-				when (order) {
-					SortOrder.RATING -> "rating"
-					SortOrder.UPDATED -> ""
-					SortOrder.POPULARITY -> "popular"
-					SortOrder.ALPHABETICAL_DESC -> "desc"
-					SortOrder.ALPHABETICAL -> "asc"
-					else -> "update"
-				},
-			)
+			if (!filter.author.isNullOrBlank()) {
+				addQueryParameter("author", filter.author)
+			}
+
+			val (sort, ascending) = order.toAsuraSortOrder()
+			if (!sort.isNullOrEmpty()) {
+				addQueryParameter("sort", sort)
+			}
+			if (ascending) {
+				addQueryParameter("order", "asc")
+			}
 		}.build()
 		val doc = webClient.httpGet(url).parseHtml()
 		return doc.select("#series-grid .series-card").mapNotNull { card ->
@@ -132,18 +154,11 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		}
 	}
 
-	private val availableTags by lazy(LazyThreadSafetyMode.NONE) {
-		ASURA_GENRES.mapTo(LinkedHashSet(ASURA_GENRES.size)) { title ->
-			MangaTag(
-				key = title.toAsuraGenreKey(),
-				title = title,
-				source = source,
-			)
-		}
-	}
+	private val availableTags = suspendLazy(initializer = ::fetchAvailableTags)
 
-	private val tagMap by lazy(LazyThreadSafetyMode.NONE) {
-		availableTags.associateByTo(LinkedHashMap(availableTags.size)) {
+	private val tagMap = suspendLazy {
+		val tags = availableTags.get()
+		tags.associateByTo(LinkedHashMap(tags.size)) {
 			it.title.lowercase(Locale.ENGLISH)
 		}
 	}
@@ -153,16 +168,20 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		val availableTagMap = tagMap.get()
 		val selectTag = doc.select("div[class^=space] > div.flex > button.text-white")
 		val tags = selectTag.mapNotNullToSet { element ->
 			val title = element.text().trim().nullIfEmpty() ?: return@mapNotNullToSet null
-			tagMap[title.lowercase(Locale.ENGLISH)] ?: MangaTag(
+			availableTagMap[title.lowercase(Locale.ENGLISH)] ?: MangaTag(
 				key = title.toAsuraGenreKey(),
 				title = title,
 				source = source,
 			)
 		}
-		val author = doc.selectFirst("div.grid > div:has(h3:eq(0):containsOwn(Author)) > h3:eq(1)")?.text().orEmpty()
+		val author = doc.selectFirst("div.grid > div:has(h3:eq(0):containsOwn(Author)) > h3:eq(1)")
+			?.text()
+			?.trim()
+			?.nullIfEmpty()
 		val cutoffTime = System.currentTimeMillis() - CHAPTER_HIDE_WINDOW_MS
 		return manga.copy(
 			title = doc.selectFirst("article h1")
@@ -181,7 +200,7 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 				?.takeIf { it.isNotEmpty() }
 				?: doc.selectFirst("span.font-medium.text-sm")?.text().orEmpty(),
 			tags = tags,
-			authors = setOf(author),
+			authors = setOfNotNull(author),
 			chapters = doc.select("a.group[href*=/chapter/]").mapChapters(reversed = true) { i, a ->
 				val urlRelative = a.attrAsRelativeUrl("href")
 				val titleElement = a.selectFirst("span.font-medium") ?: a.selectFirst("span")
@@ -268,6 +287,32 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		}
 	}
 
+	private suspend fun fetchAvailableTags(): Set<MangaTag> {
+		val json = webClient.httpGet("https://api.$domain/api/genres").parseJson()
+		val genres = json.optJSONArray("data") ?: return emptySet()
+		return genres.mapJSONToSet { jo ->
+			MangaTag(
+				key = jo.getString("slug"),
+				title = jo.getString("name"),
+				source = source,
+			)
+		}
+	}
+
+	private fun SortOrder.toAsuraSortOrder(): Pair<String?, Boolean> = when (this) {
+		SortOrder.UPDATED -> null to false
+		SortOrder.UPDATED_ASC -> null to true
+		SortOrder.POPULARITY -> "popular" to false
+		SortOrder.POPULARITY_ASC -> "popular" to true
+		SortOrder.RATING -> "rating" to false
+		SortOrder.RATING_ASC -> "rating" to true
+		SortOrder.ALPHABETICAL_DESC -> "name" to false
+		SortOrder.ALPHABETICAL -> "name" to true
+		SortOrder.NEWEST -> "newest" to false
+		SortOrder.NEWEST_ASC -> "newest" to true
+		else -> null to false
+	}
+
 	private fun String.toAsuraGenreKey(): String {
 		return trim()
 			.lowercase(Locale.ENGLISH)
@@ -314,36 +359,6 @@ internal class AsuraScansParser(context: MangaLoaderContext) :
 		private const val CHAPTER_HIDE_WINDOW_MS = 6L * 60L * 60L * 1000L
 		private val chapterNumberRegex = Regex("""Chapter\s+(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
 		private val pageUrlRegex = Regex(""""url":\s*\[0,\s*"([^"]+)"""")
-		private val ASURA_GENRES = listOf(
-			"Action",
-			"Adventure",
-			"Comedy",
-			"Crazy MC",
-			"Demon",
-			"Dungeons",
-			"Fantasy",
-			"Game",
-			"Genius MC",
-			"Isekai",
-			"Magic",
-			"Murim",
-			"Mystery",
-			"Necromancer",
-			"Overpowered",
-			"Regression",
-			"Reincarnation",
-			"Revenge",
-			"Romance",
-			"School Life",
-			"Sci-fi",
-			"Shoujo",
-			"Shounen",
-			"System",
-			"Tower",
-			"Tragedy",
-			"Villain",
-			"Violence",
-		)
 		private val asuraGenreKeyRegex = Regex("[^a-z0-9]+")
 	}
 }
