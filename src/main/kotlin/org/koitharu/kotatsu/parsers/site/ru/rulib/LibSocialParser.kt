@@ -202,9 +202,47 @@ internal abstract class LibSocialParser(
 				val id = it.getIntOrDefault("id", -1)
 				if (id >= 4) ContentRating.SUGGESTIVE else sourceContentRating
 			} ?: manga.contentRating,
-			description = json.getString("summary").nl2br(),
+			description = parseSummary(json.getString("summary")),
 			chapters = chapters,
 		)
+	}
+
+	private fun parseSummary(rawSummary: String): String {
+		val structured = rawSummary.toJSONObjectOrNull()
+			?.let(::extractStructuredText)
+			?.trim()
+			?.replace(Regex("""\n{3,}"""), "\n\n")
+			?.takeUnless(String::isEmpty)
+		return (structured ?: rawSummary).nl2br()
+	}
+
+	private fun extractStructuredText(node: JSONObject): String = when (node.getStringOrNull("type")) {
+		"text" -> node.getStringOrNull("text").orEmpty()
+		"hardBreak" -> "\n"
+		"paragraph" -> node.optJSONArray("content")
+			?.let(::extractStructuredText)
+			?.trimEnd()
+			?.takeUnless(String::isEmpty)
+			?.plus("\n\n")
+			.orEmpty()
+
+		"listItem" -> node.optJSONArray("content")
+			?.let(::extractStructuredText)
+			?.trim()
+			?.takeUnless(String::isEmpty)
+			?.let { "• $it\n" }
+			.orEmpty()
+
+		else -> node.optJSONArray("content")?.let(::extractStructuredText).orEmpty()
+	}
+
+	private fun extractStructuredText(nodes: JSONArray): String = buildString {
+		for (i in 0 until nodes.length()) {
+			when (val node = nodes.opt(i)) {
+				is JSONObject -> append(extractStructuredText(node))
+				is String -> append(node)
+			}
+		}
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = coroutineScope {
