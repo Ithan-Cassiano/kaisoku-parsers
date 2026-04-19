@@ -21,6 +21,7 @@ internal class DesuMeParser(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.DESUME, 20) {
 
     override val configKeyDomain = ConfigKey.Domain(
+        "desu.uno",
         "x.desu.city",
         "" +
             "desu.city",
