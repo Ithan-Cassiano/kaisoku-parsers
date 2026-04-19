@@ -1,6 +1,6 @@
 # Contributing
 
-The following is a guide for creating Kotatsu parsers. Thanks for taking the time to contribute!
+The following is a guide for creating Kaisoku parsers. Thanks for taking the time to contribute!
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ Before you start, please note that the ability to use the following technologies
 - [IntelliJ IDEA](https://www.jetbrains.com/idea/) (Community edition is enough)
 - Android device (or emulator)
 
-Kotatsu parsers are not a part of the Android application, but you can easily develop and test it directly inside an
+Kaisoku parsers are not a part of the Android application, but you can easily develop and test them directly inside an
 Android application project and relocate it to the library project when done.
 
 ### Before you start
@@ -35,11 +35,11 @@ If it does not contain any documentation about
 API, [explore network requests](https://firefox-source-docs.mozilla.org/devtools-user/):
 some websites use AJAX.
 
-- [Example](https://github.com/KotatsuApp/kotatsu-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/ru/DesuMeParser.kt)
+- [Example](https://github.com/glitch-228/kaisoku-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/ru/DesuMeParser.kt)
   of Json API usage.
-- [Example](https://github.com/KotatsuApp/kotatsu-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/be/AnibelParser.kt)
+- [Example](https://github.com/glitch-228/kaisoku-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/be/AnibelParser.kt)
   of GraphQL API usage
-- [Example](https://github.com/KotatsuApp/kotatsu-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/en/MangaTownParser.kt)
+- [Example](https://github.com/glitch-228/kaisoku-parsers/blob/master/src/main/kotlin/org/koitharu/kotatsu/parsers/site/en/MangaTownParser.kt)
   of pure HTML parsing.
 
 If the website is based on some engine it is rationally to use a common base class for this one (for example, Madara
@@ -75,8 +75,8 @@ All members of the `MangaParser` class are documented. Pay attention to some pec
 ## Development process
 
 During the development, it is recommended (but not necessary) to write it directly
-in the Kotatsu Android application project. You can use the `core.parser.DummyParser` class as a sandbox. The `Dummy`
-manga source is available in the debug Kotatsu build.
+in the Kaisoku Android application project. You can use the `core.parser.DummyParser` class as a sandbox. The `Dummy`
+manga source is available in the debug Kaisoku build.
 
 Once the parser is ready you can relocate your code into the `kotatsu-parsers` library project in a `site` package and
 create a Pull Request.
@@ -92,5 +92,4 @@ It is recommended that unit tests be run before submitting a PR.
 
 ## Help
 
-If you need help or have some questions, ask a community in our [Telegram chat](https://t.me/kotatsuapp)
-or [Discord server](https://discord.gg/NNJ5RgVBC5).
+If you need help or have some questions, the community invite is TBD at 30+stars.
