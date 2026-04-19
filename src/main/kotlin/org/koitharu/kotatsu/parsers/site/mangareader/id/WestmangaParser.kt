@@ -67,12 +67,14 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 			addQueryParameter("page", page.toString())
 			addQueryParameter("per_page", "20")
 			addQueryParameter("type", "Comic")
+			addQueryParameter("country", "All")
+			addQueryParameter("project", "false")
 
 			when (order) {
-				SortOrder.UPDATED -> addQueryParameter("sort", "updated_at")
-				SortOrder.POPULARITY -> addQueryParameter("sort", "views")
-				SortOrder.ALPHABETICAL -> addQueryParameter("sort", "title")
-				SortOrder.NEWEST -> addQueryParameter("sort", "created_at")
+				SortOrder.UPDATED -> addQueryParameter("orderBy", "Update")
+				SortOrder.POPULARITY -> addQueryParameter("orderBy", "Popular")
+				SortOrder.ALPHABETICAL -> addQueryParameter("orderBy", "Az")
+				SortOrder.NEWEST -> addQueryParameter("orderBy", "Added")
 				else -> {}
 			}
 
@@ -82,9 +84,9 @@ internal class WestmangaParser(context: MangaLoaderContext) :
 
 			filter.states.oneOrThrowIfMany()?.let {
 				addQueryParameter("status", when (it) {
-					MangaState.ONGOING -> "ongoing"
-					MangaState.FINISHED -> "completed"
-					MangaState.PAUSED -> "hiatus"
+					MangaState.ONGOING -> "Ongoing"
+					MangaState.FINISHED -> "Completed"
+					MangaState.PAUSED -> "Hiatus"
 					else -> return@let
 				})
 			}
