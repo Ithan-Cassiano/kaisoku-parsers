@@ -232,7 +232,7 @@ internal class RemangaParser(
 		}
 		val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
 		return Manga(
-			id = generateUid(url),
+			id = generateStableMangaUid(url),
 			url = url,
 			publicUrl = "https://$domain$url/main",
 			title = jo.getString("main_name"),
@@ -296,7 +296,7 @@ internal class RemangaParser(
 		val url = "/manga/${jo.getString("dir")}"
 		val cover = jo.getJSONObject("cover")
 		return Manga(
-			id = generateUid(url),
+			id = generateStableMangaUid(url),
 			url = url,
 			publicUrl = "https://$domain$url/main",
 			title = jo.getString("main_name"),
@@ -346,6 +346,12 @@ internal class RemangaParser(
 		SortOrder.RATING -> "-votes"
 		SortOrder.NEWEST -> "-id"
 		else -> "-chapter_date"
+	}
+
+	private fun generateStableMangaUid(url: String): Long {
+		// Remanga started returning canonical dirs with a trailing underscore for some older titles.
+		// Keep the legacy id so existing favorites/history do not split from the same manga URL.
+		return generateUid(url.removeSuffix("_"))
 	}
 
 	private fun parsePage(jo: JSONObject) = MangaPage(
