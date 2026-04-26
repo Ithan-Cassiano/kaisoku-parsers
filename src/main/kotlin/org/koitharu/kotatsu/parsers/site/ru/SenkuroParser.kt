@@ -1,13 +1,16 @@
 package org.koitharu.kotatsu.parsers.site.ru
 
+import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
+import org.koitharu.kotatsu.parsers.MangaParserAuthProvider
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.AuthRequiredException
 import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.model.ContentType
@@ -23,6 +26,7 @@ import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.getCookies
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
@@ -38,7 +42,8 @@ import java.util.Locale
 
 @MangaSourceParser("SENKURO", "Senkuro", "ru")
 internal class SenkuroParser(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.SENKURO, pageSize = PAGE_SIZE) {
+	PagedMangaParser(context, MangaParserSource.SENKURO, pageSize = PAGE_SIZE),
+	MangaParserAuthProvider {
 
 	override val configKeyDomain = ConfigKey.Domain("senkuro.me", "senkuro.com")
 
@@ -51,7 +56,15 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 		.add("Content-Type", "application/json")
 		.add("Origin", "https://$domain")
 		.add("Referer", "https://$domain/")
+		.apply {
+			getAuthToken()?.let { token ->
+				set("Authorization", "Bearer $token")
+			}
+		}
 		.build()
+
+	override val authUrl: String
+		get() = "https://$domain"
 
 	private val graphQlEndpoint: String
 		get() = if (domain == "senkuro.com") {
@@ -62,7 +75,13 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.POPULARITY,
+		SortOrder.POPULARITY_ASC,
+		SortOrder.RATING,
+		SortOrder.RATING_ASC,
+		SortOrder.NEWEST,
+		SortOrder.NEWEST_ASC,
 		SortOrder.UPDATED,
+		SortOrder.UPDATED_ASC,
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
@@ -75,6 +94,22 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 
 	@Volatile
 	private var cachedTags: Set<MangaTag>? = null
+
+	override suspend fun isAuthorized(): Boolean = !getAuthToken().isNullOrBlank()
+
+	override suspend fun getUsername(): String {
+		if (!isAuthorized()) {
+			throw AuthRequiredException(source)
+		}
+		val user = postGraphQl(VIEWER_QUERY, JSONObject())
+			.optJSONObject("viewer")
+			?.optJSONObject("user")
+			?: throw AuthRequiredException(source)
+		return user.getStringOrNull("username")
+			?: user.getStringOrNull("name")
+			?: user.getStringOrNull("slug")
+			?: throw ParseException("Cannot parse user name", graphQlEndpoint)
+	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions {
 		return MangaListFilterOptions(
@@ -114,24 +149,42 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 		val variables = JSONObject().apply {
 			val query = filter.query?.trim().orEmpty()
 			if (query.isNotEmpty()) {
-				put("query", query)
+				put("search", query)
 			}
-			put("offset", PAGE_SIZE * (page - 1))
+			put("first", PAGE_SIZE)
+			put("orderField", order.toApiOrderField())
+			put("orderDirection", order.toApiOrderDirection())
 			putFilter("label", includeLabels, excludeLabels)
 			putFilter("type", includeTypes, emptyList())
 			putFilter("status", includeStatuses, emptyList())
 			putFilter("rating", includeRatings, emptyList())
-			put("format", JSONObject())
-			put("translationStatus", JSONObject())
 		}
 
-		val data = postGraphQl(SEARCH_QUERY, variables)
-		val mangas = data
-			.optJSONObject("mangaTachiyomiSearch")
-			?.optJSONArray("mangas")
-			?: JSONArray()
-		return (0 until mangas.length()).mapNotNull { i ->
-			parseMangaCard(mangas.optJSONObject(i))
+		var cursor: String? = null
+		var payload: JSONObject? = null
+		val targetPage = page.coerceAtLeast(1)
+		for (index in 1..targetPage) {
+			if (cursor.isNullOrBlank()) {
+				variables.remove("after")
+			} else {
+				variables.put("after", cursor)
+			}
+			payload = postGraphQl(SEARCH_QUERY, variables).optJSONObject("mangas")
+			val nextCursor = payload
+				?.optJSONObject("pageInfo")
+				?.getStringOrNull("endCursor")
+			if (index == targetPage) {
+				break
+			}
+			if (nextCursor.isNullOrBlank()) {
+				return emptyList()
+			}
+			cursor = nextCursor
+		}
+
+		val edges = payload?.optJSONArray("edges") ?: JSONArray()
+		return (0 until edges.length()).mapNotNull { i ->
+			parseMangaCard(edges.optJSONObject(i)?.optJSONObject("node"))
 		}
 	}
 
@@ -522,9 +575,36 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 		ContentRating.ADULT -> listOf("EXPLICIT")
 	}
 
+	private fun SortOrder.toApiOrderField(): String = when (this) {
+		SortOrder.POPULARITY, SortOrder.POPULARITY_ASC -> "POPULARITY_SCORE"
+		SortOrder.RATING, SortOrder.RATING_ASC -> "SCORE"
+		SortOrder.NEWEST, SortOrder.NEWEST_ASC -> "CREATED_AT"
+		SortOrder.UPDATED, SortOrder.UPDATED_ASC -> "LAST_CHAPTER_AT"
+		else -> "POPULARITY_SCORE"
+	}
+
+	private fun SortOrder.toApiOrderDirection(): String = when (this) {
+		SortOrder.POPULARITY_ASC,
+		SortOrder.RATING_ASC,
+		SortOrder.NEWEST_ASC,
+		SortOrder.UPDATED_ASC -> "ASC"
+		else -> "DESC"
+	}
+
+	private fun getAuthToken(): String? {
+		return context.cookieJar.getCookies(domain).firstNotBlankCookie(AUTH_COOKIE_NAME)
+			?: context.cookieJar.getCookies("senkuro.com").firstNotBlankCookie(AUTH_COOKIE_NAME)
+			?: context.cookieJar.getCookies("senkuro.me").firstNotBlankCookie(AUTH_COOKIE_NAME)
+	}
+
+	private fun List<Cookie>.firstNotBlankCookie(name: String): String? {
+		return firstOrNull { it.name == name && it.value.isNotBlank() }?.value
+	}
+
 	private companion object {
 		private const val PAGE_SIZE = 20
 		private const val URL_DELIMITER = ",,"
+		private const val AUTH_COOKIE_NAME = "access_token"
 		private val DEFAULT_EXCLUDED_LABELS = listOf("hentai", "yaoi", "yuri", "shoujo_ai", "shounen_ai", "lgbt")
 		private val DATE_PATTERNS = listOf(
 			"yyyy-MM-dd'T'HH:mm:ss.SSSX",
@@ -540,41 +620,67 @@ internal class SenkuroParser(context: MangaLoaderContext) :
 
 		private val SEARCH_QUERY: String = gqlQuery {
 			"""
-			query searchTachiyomiManga(
-				%query: String,
-				%type: MangaTachiyomiSearchTypeFilter,
-				%status: MangaTachiyomiSearchStatusFilter,
-				%translationStatus: MangaTachiyomiSearchTranslationStatusFilter,
-				%label: MangaTachiyomiSearchGenreFilter,
-				%format: MangaTachiyomiSearchGenreFilter,
-				%rating: MangaTachiyomiSearchTagFilter,
-				%offset: Int
+			query fetchMangas(
+				%first: Int = 20,
+				%after: String,
+				%search: String,
+				%type: MangaTypeFilter,
+				%status: MangaStatusFilter,
+				%label: MangaLabelFilter,
+				%rating: MangaRatingFilter,
+				%orderField: MangaOrderField = POPULARITY_SCORE,
+				%orderDirection: OrderDirection = DESC
 			) {
-				mangaTachiyomiSearch(
-					query: %query,
+				mangas(
+					first: %first,
+					after: %after,
+					orderBy: {
+						field: %orderField,
+						direction: %orderDirection
+					},
+					search: %search,
 					type: %type,
 					status: %status,
-					translationStatus: %translationStatus,
 					label: %label,
-					format: %format,
-					rating: %rating,
-					offset: %offset
+					rating: %rating
 				) {
-					mangas {
-						id
-						slug
-						titles {
-							lang
-							content
+					edges {
+						node {
+							id
+							slug
+							titles {
+								lang
+								content
+							}
+							status
+							rating
+							cover {
+								original {
+									url
+								}
+							}
 						}
-					cover {
-						original {
-							url
-						}
+					}
+					pageInfo {
+						hasNextPage
+						endCursor
 					}
 				}
 			}
+			"""
 		}
+
+		private val VIEWER_QUERY: String = gqlQuery {
+			"""
+			query fetchViewer {
+				viewer {
+					user {
+						username
+						name
+						slug
+					}
+				}
+			}
 			"""
 		}
 
