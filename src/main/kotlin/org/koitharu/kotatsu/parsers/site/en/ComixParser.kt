@@ -19,6 +19,7 @@ internal class Comix(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.COMIX, 28) {
 
     override val configKeyDomain = ConfigKey.Domain("comix.to")
+    private val nsfwGenreIds = arrayOf("87264", "87265", "87266", "87268")
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
@@ -40,6 +41,7 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = fetchAvailableTags(),
+        availableContentRating = EnumSet.of(ContentRating.ADULT),
     )
 
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
@@ -147,11 +149,9 @@ internal class Comix(context: MangaLoaderContext) :
                 }
             }
 
-            // Default exclude adult content
-            addParam("genres[]=-87264") // Adult
-            addParam("genres[]=-87266") // Hentai
-            addParam("genres[]=-87268") // Smut
-            addParam("genres[]=-87265") // Ecchi
+            if (filter.contentRating.isEmpty()) {
+                nsfwGenreIds.forEach { addParam("genres[]=-$it") }
+            }
             addParam("limit=$pageSize")
             addParam("page=$page")
         }
@@ -196,7 +196,7 @@ internal class Comix(context: MangaLoaderContext) :
             authors = emptySet(),
             state = state,
             source = source,
-            contentRating = ContentRating.SAFE,
+            contentRating = if (json.optBoolean("is_nsfw", false)) ContentRating.ADULT else ContentRating.SAFE,
         )
     }
 

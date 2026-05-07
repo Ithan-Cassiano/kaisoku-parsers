@@ -7,7 +7,9 @@ okhttp = "5.1.0"
 okio = "3.16.0"
 json = "20240303"
 androidx-collection = "1.5.0"
-jsoup = "1.21.2"
+# Keep Android 5, 6 compatible (with SDK 21 - 23)
+#noinspection NewerVersionAvailable
+jsoup = "1.17.2"
 quickjs = "1.1.0"
 korte = "4.0.10"
 simplexml = "2.7.1"

@@ -205,7 +205,7 @@ internal class BacaKomik(context: MangaLoaderContext) :
 			}
 	}
 
-	private fun parseChapterDate(date: String?): Long {
+	override fun parseChapterDate(date: String?): Long {
 		date ?: return 0
 		val normalized = date.lowercase()
 		return when {

@@ -124,7 +124,7 @@ internal class PeachBl(context: MangaLoaderContext) :
 
 			// Parse upload date from chapter-date element (format: 2025.02.10)
 			val dateText = element.selectFirst(".chapter-date")?.text()
-			val uploadDate = dateText?.let { parseChapterDate(it) } ?: 0L
+			val uploadDate = dateText?.let { parsePeachChapterDate(it) } ?: 0L
 
 			MangaChapter(
 				id = generateUid(url),
@@ -171,7 +171,7 @@ internal class PeachBl(context: MangaLoaderContext) :
 		return regex.find(title)?.groupValues?.get(1)?.toFloatOrNull()
 	}
 
-	private fun parseChapterDate(dateString: String): Long {
+	private fun parsePeachChapterDate(dateString: String): Long {
 		return try {
 			// Parse date format like "2025.02.10"
 			val dateFormat = SimpleDateFormat("yyyy.MM.dd", Locale.US)
