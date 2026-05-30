@@ -1,10 +1,13 @@
 package org.koitharu.kotatsu.parsers.site.pt
 
 import androidx.collection.ArraySet
+import okhttp3.Headers
+import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.getDoubleOrDefault
@@ -15,7 +18,7 @@ import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("SSSSCANLATOR", "YomuComics", "pt")
+@MangaSourceParser("SSSSCANLATOR", "Yomu", "pt")
 internal class SssScanlator(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.SSSSCANLATOR, pageSize = 20) {
 
@@ -27,6 +30,15 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
 	}
+
+	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+		.add("Origin", "https://$domain")
+		.add("Referer", "https://$domain/")
+		.build()
+
+	private fun getApiHeaders(): Headers = getRequestHeaders().newBuilder()
+		.set("Accept", "application/json")
+		.build()
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -99,8 +111,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			}
 		}
 
-		val json = webClient.httpGet(url).parseJson()
-		val data = json.getJSONArray("data")
+		val json = webClient.httpGet(url, getApiHeaders()).parseJson()
+		val data = json.optLibraryArray() ?: return emptyList()
 		return data.mapJSON { obj ->
 			val slug = obj.getString("slug")
 			val relUrl = "/obra/$slug"
@@ -126,33 +138,22 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val html = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseRaw()
+		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain), getRequestHeaders()).parseHtml()
+		val slug = manga.url.removePrefix("/obra/").trimEnd('/')
+		val html = doc.html()
 		val rsc = extractRscPayload(html)
-		val dateFormat = SimpleDateFormat("dd/MM/yyyy", sourceLocale)
 
-		val description = extractJsonString(rsc, "description")
+		val description = doc.selectFirst("meta[property=og:description]")?.attr("content")
+			?.takeUnless { it.isBlank() }
+			?: extractJsonString(rsc, "description")
 		val author = extractJsonString(rsc, "author")
 		val artist = extractJsonString(rsc, "artist")
-		val coverImage = extractJsonString(rsc, "coverImage")
+		val coverImage = doc.selectFirst("meta[property=og:image]")?.attr("content")
+			?: extractJsonString(rsc, "coverImage")
 
-		val chaptersJson = extractJsonArray(rsc)
-		val chapters = chaptersJson?.mapJSONNotNull { obj ->
-			val id = obj.getStringOrNull("id") ?: return@mapJSONNotNull null
-			val number = obj.getDoubleOrDefault("number", 0.0).toFloat()
-			val chapterUrl = "/api/chapters?id=$id"
-			MangaChapter(
-				id = generateUid(chapterUrl),
-				title = obj.getStringOrNull("title"),
-				number = number,
-				volume = 0,
-				url = chapterUrl,
-				scanlator = obj.getStringOrNull("scanName")?.takeUnless { it == "Desconhecido" },
-				uploadDate = obj.getStringOrNull("releaseDate")
-					?.let { runCatching { dateFormat.parse(it)?.time }.getOrNull() } ?: 0L,
-				branch = null,
-				source = source,
-			)
-		}?.sortedBy { it.number }?.toList().orEmpty()
+		val chapters = parseChaptersFromRsc(rsc)
+			.ifEmpty { parseChaptersFromHtml(doc, slug) }
+			.sortedBy { it.number }
 
 		val authors = buildSet {
 			author?.takeUnless { it.isBlank() }?.let(::add)
@@ -169,8 +170,46 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val json = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseJson()
-		val content = json.getJSONObject("chapter").getJSONArray("content")
+		if (chapter.url.startsWith("/api/chapters")) {
+			return fetchPagesFromApi(chapter.url)
+		}
+		val match = CHAPTER_URL_REGEX.matchEntire(chapter.url)
+			?: throw ParseException("Formato de URL de capítulo inválido", chapter.url)
+		val slug = resolveObraSlug(match.groupValues[1])
+		val chapterNumber = match.groupValues[2]
+		val chapterId = resolveChapterId(slug, chapterNumber)
+		if (chapterId != null) {
+			val pages = fetchPagesFromApi("/api/chapters?id=$chapterId")
+			if (pages.isNotEmpty()) {
+				return pages
+			}
+		}
+		val readerPages = fetchPagesFromReader(slug, chapterNumber)
+		if (readerPages.isNotEmpty()) {
+			return readerPages
+		}
+		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
+	}
+
+	override suspend fun getPageUrl(page: MangaPage): String {
+		if (page.url.startsWith("http://") || page.url.startsWith("https://")) {
+			return page.url
+		}
+		return super.getPageUrl(page)
+	}
+
+	private suspend fun fetchPagesFromApi(chapterUrl: String): List<MangaPage> {
+		val json = webClient.httpGet(chapterUrl.toAbsoluteUrl(domain), getApiHeaders()).parseJson()
+		json.optString("error").takeUnless { it.isBlank() }?.let { message ->
+			throw ParseException(message, chapterUrl)
+		}
+		if (json.optBoolean("isLocked")) {
+			throw ParseException("Este capítulo ainda não foi lançado ou está bloqueado.", chapterUrl)
+		}
+		val chapter = json.optJSONObject("chapter")
+			?: throw ParseException("Resposta inválida da API de capítulos", chapterUrl)
+		val content = chapter.optJSONArray("content")
+			?: throw ParseException("Capítulo sem páginas", chapterUrl)
 		val result = ArrayList<MangaPage>(content.length())
 		for (i in 0 until content.length()) {
 			val url = content.getString(i)
@@ -186,12 +225,188 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return result
 	}
 
+	private suspend fun fetchPagesFromReader(slug: String, chapterNumber: String): List<MangaPage> {
+		val readerUrl = "https://$domain/ler/$slug/$chapterNumber"
+		val rawHtml = webClient.httpGet(readerUrl, getRequestHeaders()).parseHtml().html()
+		val rsc = extractRscPayload(rawHtml)
+		val urls = LinkedHashSet<String>()
+		CDN_PAGE_REGEX.findAll(rawHtml).forEach { urls.add(it.value) }
+		CDN_PAGE_REGEX.findAll(rsc).forEach { urls.add(it.value) }
+		IMAGENS_LISTA_REGEX.find(rsc)?.groupValues?.get(1)?.let { listBody ->
+			Regex("""https://[^"\\]+""").findAll(listBody).forEach { urls.add(it.value) }
+		}
+		return urls.map { url ->
+			MangaPage(
+				id = generateUid(url),
+				url = url,
+				preview = null,
+				source = source,
+			)
+		}
+	}
+
+	private suspend fun resolveObraSlug(slug: String): String {
+		if (getChapterIdMap(slug).isNotEmpty()) {
+			return slug
+		}
+		val query = slug.replace('-', ' ').urlEncoded()
+		val json = webClient.httpGet(
+			"https://$domain/api/library?search=$query&limit=20",
+			getApiHeaders(),
+		).parseJson()
+		val arr = json.optLibraryArray() ?: return slug
+		for (i in 0 until arr.length()) {
+			val obra = arr.optJSONObject(i) ?: continue
+			val candidate = obra.optString("slug")
+			if (candidate.isBlank()) continue
+			if (candidate == slug || slugSimilar(slug, candidate)) {
+				chapterIdCache.remove(slug)
+				return candidate
+			}
+		}
+		return slug
+	}
+
+	private fun slugSimilar(requested: String, candidate: String): Boolean {
+		if (requested == candidate) return true
+		if (requested.length < 8 || candidate.length < 8) return false
+		val minLen = minOf(requested.length, candidate.length)
+		var same = 0
+		for (i in 0 until minLen) {
+			if (requested[i] == candidate[i]) same++
+		}
+		return same >= minLen - 2
+	}
+
+	private suspend fun resolveChapterId(slug: String, chapterNumber: String): String? {
+		getChapterIdMap(slug)[chapterNumber]?.let { return it }
+		val json = webClient.httpGet(
+			"https://$domain/api/library?slug=$slug&limit=1",
+			getApiHeaders(),
+		).parseJson()
+		val obra = json.optLibraryArray()?.optJSONObject(0) ?: return null
+		val recent = obra.optJSONArray("recentChapters") ?: return null
+		for (i in 0 until recent.length()) {
+			val ch = recent.optJSONObject(i) ?: continue
+			if (ch.optString("number") == chapterNumber) {
+				return ch.getStringOrNull("id")
+			}
+		}
+		return null
+	}
+
+	private suspend fun getChapterIdMap(slug: String): Map<String, String> {
+		chapterIdCache[slug]?.let { return it }
+		val response = webClient.httpGet("https://$domain/obra/$slug", getRequestHeaders())
+		if (!response.isSuccessful) {
+			response.close()
+			chapterIdCache[slug] = emptyMap()
+			return emptyMap()
+		}
+		val doc = response.parseHtml()
+		val rsc = extractRscPayload(doc.html())
+		val map = parseChapterIdMapFromRsc(rsc).toMutableMap()
+		parseChaptersFromRsc(rsc).forEach { ch ->
+			val numKey = chapterNumberKey(ch.number)
+			val id = ch.url.removePrefix("/api/chapters?id=")
+			if (id.isNotBlank()) {
+				map.putIfAbsent(numKey, id)
+			}
+		}
+		chapterIdCache[slug] = map
+		return map
+	}
+
+	private fun parseChapterIdMapFromRsc(rsc: String): Map<String, String> {
+		val map = LinkedHashMap<String, String>()
+		for (match in CHAPTER_ENTRY_REGEX.findAll(rsc)) {
+			val number = match.groupValues[1]
+			val id = match.groupValues[2]
+			map[number] = id
+			number.toFloatOrNull()?.let { f -> map.putIfAbsent(chapterNumberKey(f), id) }
+		}
+		return map
+	}
+
+	private fun chapterNumberKey(number: Float): String =
+		if (number == number.toLong().toFloat()) number.toLong().toString() else number.toString()
+
+	private fun parseChaptersFromHtml(doc: Document, slug: String): List<MangaChapter> {
+		val selector = "a[href^=/ler/$slug/]"
+		val dateFormat = SimpleDateFormat("yyyy-MM-dd", sourceLocale)
+		return doc.select(selector).mapNotNull { anchor ->
+			val href = anchor.attr("href").trim()
+			val numberStr = href.substringAfterLast('/')
+			val number = numberStr.toFloatOrNull() ?: return@mapNotNull null
+			val title = anchor.selectFirst("[title]")?.attr("title")?.takeUnless { it.isBlank() }
+				?: anchor.text().takeIf { it.isNotBlank() }
+			val uploadDate = anchor.selectFirst("time[datetime]")?.attr("datetime")
+				?.let { runCatching { dateFormat.parse(it)?.time }.getOrNull() }
+				?: 0L
+			MangaChapter(
+				id = generateUid(href),
+				title = title,
+				number = number,
+				volume = 0,
+				url = href,
+				scanlator = null,
+				uploadDate = uploadDate,
+				branch = null,
+				source = source,
+			)
+		}.distinctBy { it.url }
+	}
+
+	private fun parseChaptersFromRsc(rsc: String): List<MangaChapter> {
+		val chaptersJson = extractJsonArray(rsc, "chapters")
+		if (chaptersJson != null) {
+			return mapChaptersFromJsonArray(chaptersJson)
+		}
+		return parseChapterIdMapFromRsc(rsc).map { (number, id) ->
+			val chapterUrl = "/api/chapters?id=$id"
+			MangaChapter(
+				id = generateUid(chapterUrl),
+				title = null,
+				number = number.toFloatOrNull() ?: 0f,
+				volume = 0,
+				url = chapterUrl,
+				scanlator = null,
+				uploadDate = 0L,
+				branch = null,
+				source = source,
+			)
+		}
+	}
+
+	private fun mapChaptersFromJsonArray(chaptersJson: org.json.JSONArray): List<MangaChapter> {
+		val dateFormat = SimpleDateFormat("dd/MM/yyyy", sourceLocale)
+		return chaptersJson.mapJSONNotNull { obj ->
+			val id = obj.getStringOrNull("id") ?: return@mapJSONNotNull null
+			val number = obj.getDoubleOrDefault("number", 0.0).toFloat()
+			val chapterUrl = "/api/chapters?id=$id"
+			MangaChapter(
+				id = generateUid(chapterUrl),
+				title = obj.getStringOrNull("title"),
+				number = number,
+				volume = 0,
+				url = chapterUrl,
+				scanlator = obj.getStringOrNull("scanName")?.takeUnless { it == "Desconhecido" },
+				uploadDate = obj.getStringOrNull("releaseDate")
+					?.let { runCatching { dateFormat.parse(it)?.time }.getOrNull() } ?: 0L,
+				branch = null,
+				source = source,
+			)
+		}
+	}
+
+	private val chapterIdCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+
 	private val tagsCache = suspendLazy(initializer = ::loadTags)
 
 	private suspend fun fetchTags(): Set<MangaTag> = tagsCache.get()
 
 	private suspend fun loadTags(): Set<MangaTag> {
-		val arr = webClient.httpGet("https://$domain/api/genres").parseJsonArray()
+		val arr = webClient.httpGet("https://$domain/api/genres", getApiHeaders()).parseJsonArray()
 		val result = ArraySet<MangaTag>(arr.length())
 		for (i in 0 until arr.length()) {
 			val name = arr.getString(i)
@@ -254,8 +469,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return decodeEscapes(match.groupValues[1]).takeUnless { it.isBlank() }
 	}
 
-	private fun extractJsonArray(text: String): org.json.JSONArray? {
-		val keyPattern = "\"chapters\":["
+	private fun extractJsonArray(text: String, key: String): org.json.JSONArray? {
+		val keyPattern = "\"$key\":["
 		val startIndex = text.indexOf(keyPattern)
 		if (startIndex < 0) return null
 		var i = startIndex + keyPattern.length - 1
@@ -285,5 +500,19 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			i++
 		}
 		return null
+	}
+
+	private fun org.json.JSONObject.optLibraryArray(): org.json.JSONArray? =
+		optJSONArray("acervo")
+			?: optJSONArray("obras")
+			?: optJSONArray("data")
+
+	private companion object {
+		val CHAPTER_URL_REGEX = Regex("""^/ler/([^/]+)/([^/]+)$""")
+		val CHAPTER_ENTRY_REGEX = Regex("""\{"number":(\d+(?:\.\d+)?).*?"id":"([^"]+)"""")
+		val IMAGENS_LISTA_REGEX = Regex(""""imagens_lista":\[([^\]]*)\]""")
+		val CDN_PAGE_REGEX = Regex(
+			"""https://cdn\.(?:monstercomics|yomu)\.com\.br/obras/[^"'\s<>\\]+\.(?:webp|jpg|jpeg|png)""",
+		)
 	}
 }

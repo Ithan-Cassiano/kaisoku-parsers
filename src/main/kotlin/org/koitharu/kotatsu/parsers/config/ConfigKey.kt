@@ -70,4 +70,12 @@ public sealed class ConfigKey<T>(
 	public class InterceptCloudflare(
 		override val defaultValue: Boolean = false,
 	) : ConfigKey<Boolean>("intercept_cloudflare")
+
+	/**
+	 * Set when the user completed source authorization in the app.
+	 * Persists across restarts until cookies are cleared.
+	 */
+	public class AuthSession(
+		override val defaultValue: Boolean = false,
+	) : ConfigKey<Boolean>("auth_session")
 }

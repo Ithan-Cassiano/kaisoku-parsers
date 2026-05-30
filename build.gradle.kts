@@ -39,7 +39,7 @@ publishing {
     publications {
         create<MavenPublication>("mavenJava") {
             from(components["java"])
-            artifactId = "kaisoku-parsers"
+            artifactId = "kosen-parsers"
         }
     }
 }
