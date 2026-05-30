@@ -503,7 +503,9 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private fun org.json.JSONObject.optLibraryArray(): org.json.JSONArray? =
-		optJSONArray("acervo")
+		optJSONArray("prateleira")
+			?: optJSONArray("acervo")
+			?: optJSONArray("catalogo")
 			?: optJSONArray("obras")
 			?: optJSONArray("data")
 
