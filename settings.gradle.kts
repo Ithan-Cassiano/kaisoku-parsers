@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "kaisoku-parsers"
-include("kotatsu-parsers-ksp")
+rootProject.name = "kosen-parsers"
+include("kosen-parsers-ksp")

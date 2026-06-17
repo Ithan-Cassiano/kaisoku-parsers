@@ -1,0 +1,35 @@
+package com.kosen.reader.parsers.site.manga18.en
+
+import org.jsoup.nodes.Document
+import com.kosen.reader.parsers.MangaLoaderContext
+import com.kosen.reader.parsers.MangaSourceParser
+import com.kosen.reader.parsers.model.*
+import com.kosen.reader.parsers.site.manga18.Manga18Parser
+import com.kosen.reader.parsers.util.*
+
+@MangaSourceParser("HENTAI3ZCC", "Hentai3z.cc", "en", ContentType.HENTAI)
+internal class Hentai3zCc(context: MangaLoaderContext) :
+	Manga18Parser(context, MangaParserSource.HENTAI3ZCC, "hentai3z.cc") {
+
+	override fun parseMangaList(doc: Document): List<Manga> {
+		return doc.select("div.story_item").map { div ->
+			val href = div.selectFirstOrThrow("a").attrAsRelativeUrl("href")
+			Manga(
+				id = generateUid(href),
+				url = href,
+				publicUrl = href.toAbsoluteUrl(div.host ?: domain),
+				coverUrl = div.selectFirst("img")?.src()
+					?.replace("cover_thumb_2.webp", "cover_250x350.jpg")
+					?.replace("admin.manga18.us", "bk.18porncomic.com"),
+				title = div.selectFirst("div.mg_info")?.selectFirst("div.mg_name a")?.text().orEmpty(),
+				altTitles = emptySet(),
+				rating = RATING_UNKNOWN,
+				tags = emptySet(),
+				authors = emptySet(),
+				state = null,
+				source = source,
+				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
+			)
+		}
+	}
+}

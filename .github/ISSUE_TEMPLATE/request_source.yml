@@ -49,5 +49,5 @@ body:
                     required: true
                 -   label: I have checked that the source does not already exist on the app.
                     required: true
-                -   label: I have checked that the source does not already exist by searching the [GitHub repository](https://github.com/glitch-228/kaisoku-parsers) and verified it does not appear in the code base.
+                -   label: I have checked that the source does not already exist by searching the [GitHub repository](https://github.com/Ithan-Cassiano/kosen-parsers) and verified it does not appear in the code base.
                     required: true

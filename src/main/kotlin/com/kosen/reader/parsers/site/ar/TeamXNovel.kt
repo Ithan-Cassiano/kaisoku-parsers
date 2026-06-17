@@ -1,0 +1,308 @@
+package com.kosen.reader.parsers.site.ar
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import org.jsoup.nodes.Element
+import com.kosen.reader.parsers.MangaLoaderContext
+import com.kosen.reader.parsers.MangaSourceParser
+import com.kosen.reader.parsers.config.ConfigKey
+import com.kosen.reader.parsers.core.PagedMangaParser
+import com.kosen.reader.parsers.model.*
+import com.kosen.reader.parsers.util.*
+import java.text.SimpleDateFormat
+import java.util.*
+
+@MangaSourceParser("TEAMXNOVEL", "TeamXNovel", "ar")
+internal class TeamXNovel(context: MangaLoaderContext) :
+	PagedMangaParser(context, MangaParserSource.TEAMXNOVEL, 10) {
+
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED, SortOrder.POPULARITY)
+
+	override val configKeyDomain = ConfigKey.Domain("olympustaff.com")
+
+	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+		super.onCreateConfig(keys)
+		keys.add(userAgentKey)
+	}
+
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = MangaListFilterCapabilities(
+			isSearchSupported = true,
+		)
+
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = fetchAvailableTags(),
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.ABANDONED),
+		availableContentTypes = EnumSet.of(
+			ContentType.MANGA,
+			ContentType.MANHWA,
+			ContentType.MANHUA,
+		),
+	)
+
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val url = buildString {
+			append("https://")
+			append(domain)
+			when {
+				!filter.query.isNullOrEmpty() -> {
+					append("/?search=")
+					append(filter.query.urlEncoded())
+					append("&page=")
+					append(page)
+				}
+
+				else -> {
+
+					if (order == SortOrder.UPDATED) {
+						if (filter.tags.isNotEmpty() || filter.demographics.isNotEmpty()) {
+							throw IllegalArgumentException("Updated sorting does not support other sorting filters")
+						}
+						append("/?page=")
+						append(page.toString())
+					} else {
+						append("/series?page=")
+						append(page.toString())
+
+						filter.tags.oneOrThrowIfMany()?.let {
+							append("&genre=")
+							append(it.key)
+						}
+
+						filter.types.forEach {
+							append("&type=")
+							append(
+								when (it) {
+									ContentType.MANGA -> "مانجا ياباني"
+									ContentType.MANHWA -> "مانهوا كورية"
+									ContentType.MANHUA -> "مانها صيني"
+									else -> ""
+								},
+							)
+						}
+
+						filter.states.oneOrThrowIfMany()?.let {
+							append("status=")
+							append(
+								when (it) {
+									MangaState.ONGOING -> "مستمرة"
+									MangaState.FINISHED -> "مكتمل"
+									MangaState.ABANDONED -> "متوقف"
+									else -> "مستمرة"
+								},
+							)
+						}
+					}
+				}
+			}
+		}
+		val doc = webClient.httpGet(url).parseHtml()
+		return doc.select("div.listupd .bs .bsx").ifEmpty {
+			doc.select("div.post-body .box")
+		}.map { div ->
+			val href = div.selectFirstOrThrow("a").attrAsRelativeUrl("href")
+			Manga(
+				id = generateUid(href),
+				title = div.select(".tt, h3").text(),
+				altTitles = emptySet(),
+				url = href,
+				publicUrl = href.toAbsoluteUrl(domain),
+				rating = RATING_UNKNOWN,
+				contentRating = null,
+				coverUrl = div.selectFirstOrThrow("img").src()?.replace("thumbnail_", ""),
+				tags = emptySet(),
+				state = when (div.selectFirst(".status")?.text()) {
+					"مستمرة" -> MangaState.ONGOING
+					"مكتمل" -> MangaState.FINISHED
+					"متوقف" -> MangaState.ABANDONED
+					else -> null
+				},
+				authors = emptySet(),
+				source = source,
+			)
+		}
+	}
+
+	private suspend fun fetchAvailableTags(): Set<MangaTag> {
+		val doc = webClient.httpGet("https://$domain/series").parseHtml()
+		return doc.requireElementById("select_genre").select("option").mapToSet {
+			MangaTag(
+				key = it.attr("value"),
+				title = it.text().toTitleCase(sourceLocale),
+				source = source,
+			)
+		}
+	}
+
+	override suspend fun getDetails(manga: Manga): Manga {
+		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		val mangaUrl = manga.url.toAbsoluteUrl(domain)
+		val maxPageChapterSelect = doc.select(".pagination .page-item a")
+		var maxPageChapter = 1
+		if (!maxPageChapterSelect.isNullOrEmpty()) {
+			maxPageChapterSelect.forEach {
+				val i = it.attr("href").substringAfterLast("=").toInt()
+				if (i > maxPageChapter) {
+					maxPageChapter = i
+				}
+			}
+		}
+		return manga.copy(
+			state = when (doc.selectFirstOrThrow(".full-list-info:contains(الحالة:) a").text()) {
+				"مستمرة" -> MangaState.ONGOING
+				"مكتمل" -> MangaState.FINISHED
+				"متوقف" -> MangaState.ABANDONED
+				else -> null
+			},
+			tags = doc.select(".review-author-info a").mapToSet { a ->
+				MangaTag(
+					key = a.attr("href").substringAfterLast("="),
+					title = a.text(),
+					source = source,
+				)
+			},
+			description = doc.selectFirstOrThrow(".review-content").html(),
+			chapters = run {
+				if (maxPageChapter == 1) {
+					parseChapters(doc)
+				} else {
+					coroutineScope {
+						val result = ArrayList(parseChapters(doc))
+						result.ensureCapacity(result.size * maxPageChapter)
+						(2..maxPageChapter).map { i ->
+							async {
+								loadChapters(mangaUrl, i)
+							}
+						}.awaitAll()
+							.flattenTo(result)
+						result
+					}
+				}
+			}.reversed(),
+		)
+	}
+
+	private suspend fun loadChapters(baseUrl: String, page: Int): List<MangaChapter> {
+		return parseChapters(webClient.httpGet("$baseUrl?page=$page").parseHtml().body())
+	}
+
+	private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", sourceLocale)
+
+	private fun parseChapters(root: Element): List<MangaChapter> {
+		val chapters = root.select("#chaptersContainer .chapter-card").ifEmpty {
+			root.select("div.enhanced-chapters-grid a.chapter-link").ifEmpty {
+				root.select("div.chapter-card a").ifEmpty {
+					root.select("div.eplister ul a").ifEmpty {
+						root.select("#chapter-contact .eplister ul li a")
+					}
+				}
+			}
+		}
+
+		return chapters.map { element ->
+			val link = if (element.tagName() == "a") element else element.selectFirstOrThrow("a")
+			val url = link.attrAsRelativeUrl("href")
+			val chapterNumberText = element.select(".chapter-number").text().ifEmpty {
+				element.select("div.chapter-info div.chapter-number").text().ifEmpty {
+					element.select("div.epl-num").text()
+				}
+			}
+			val chapterTitleText = element.select(".chapter-title").text().ifEmpty {
+				element.select("div.chapter-info div.chapter-title").text().ifEmpty {
+					element.select("div.epl-title").text()
+				}
+			}
+			val title = when {
+				chapterNumberText.isNotBlank() && chapterTitleText.isNotBlank() -> "$chapterNumberText - $chapterTitleText"
+				chapterTitleText.isNotBlank() -> chapterTitleText
+				else -> chapterNumberText
+			}
+			val dateText = element.select(".chapter-date span, .chapter-date").text().ifEmpty {
+				element.select("div.chapter-info div.chapter-date").text().ifEmpty {
+					element.select("div.epl-date").text()
+				}
+			}.replace(Regex("^\\s*\\S+\\s+"), "")
+			val chapterNumber = element.attr("data-number").toFloatOrNull()
+				?: chapterNumberText.filter { it.isDigit() || it == '.' }.toFloatOrNull()
+				?: url.substringAfterLast('/').toFloatOrNull()
+				?: 0f
+
+			MangaChapter(
+				id = generateUid(url),
+				title = title,
+				number = chapterNumber,
+				volume = 0,
+				url = url,
+				scanlator = null,
+				uploadDate = parseChapterDate(dateText),
+				branch = null,
+				source = source,
+			)
+		}
+	}
+
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val fullUrl = chapter.url.toAbsoluteUrl(domain)
+		val doc = webClient.httpGet(fullUrl).parseHtml()
+		return doc.select(".image_list img, .image_list canvas").map { img ->
+			val url = when {
+				img.hasAttr("src") -> img.requireSrc().toRelativeUrl(domain)
+				else -> img.attrAsRelativeUrl("data-src")
+			}
+
+			MangaPage(
+				id = generateUid(url),
+				url = url,
+				preview = null,
+				source = source,
+			)
+		}
+	}
+
+	private fun parseChapterDate(dateText: String?): Long {
+		if (dateText == null) return 0
+
+		val relativeTimePattern = Regex("(\\d+)\\s*(minute|minutes|hour|hours|day|days|week|weeks|year|years)", RegexOption.IGNORE_CASE)
+		val absoluteTimePattern = Regex("(\\d{2}-\\d{2}-\\d{4})")
+
+		return when {
+			dateText.contains("minute", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val minutes = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - minutes * 60 * 1000
+			}
+
+			dateText.contains("hour", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val hours = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - hours * 3600 * 1000
+			}
+
+			dateText.contains("day", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val days = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - days * 86400 * 1000
+			}
+
+			dateText.contains("week", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val weeks = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - weeks * 7 * 86400 * 1000
+			}
+
+			dateText.contains("year", ignoreCase = true) -> {
+				val match = relativeTimePattern.find(dateText)
+				val years = match?.groups?.get(1)?.value?.toIntOrNull() ?: 0
+				System.currentTimeMillis() - years * 365L * 86400 * 1000
+			}
+
+			absoluteTimePattern.matches(dateText) -> {
+				val formatter = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
+				formatter.parseSafe(dateText)
+			}
+
+			else -> dateFormat.parseSafe(dateText)
+		}
+	}
+}
