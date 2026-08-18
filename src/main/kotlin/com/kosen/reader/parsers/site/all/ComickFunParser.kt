@@ -196,19 +196,35 @@ internal class ComickFunParser(context: MangaLoaderContext) :
     }
 
     private suspend fun getSearchResultsViaHtml(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // Build search URL for HTML page (not API)
-        val searchUrl = buildString {
-            append("https://$domain/search")
+        // Build search URL for HTML page (not API), mirroring the query params used by the JSON API above
+        val searchUrl = urlBuilder()
+            .scheme("https")
+            .host(domain)
+            .addPathSegment("search")
+            .apply {
+                filter.query?.let { query ->
+                    addQueryParameter("q", query.trim())
+                }
 
-            // Add search query if present
-            filter.query?.let { query ->
-                append("?q=")
-                append(query.urlEncoded())
+                filter.tags.forEach {
+                    addQueryParameter("genres", it.key)
+                }
+                filter.tagsExclude.forEach {
+                    addQueryParameter("excludes", it.key)
+                }
+
+                filter.demographics.forEach {
+                    addQueryParameter("demographic", when (it) {
+                        Demographic.SHOUNEN -> "shounen"
+                        Demographic.SHOUJO -> "shoujo"
+                        Demographic.SEINEN -> "seinen"
+                        Demographic.JOSEI -> "josei"
+                        else -> ""
+                    })
+                }
             }
-
-            // For now, fallback to empty list if complex filters
-            // TODO: Build proper HTML search URLs for genres/demographics
-        }
+            .build()
+            .toString()
 
         val script = """
             (() => {

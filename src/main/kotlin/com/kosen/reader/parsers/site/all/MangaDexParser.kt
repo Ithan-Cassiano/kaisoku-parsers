@@ -371,12 +371,19 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			if (server == SERVER_DATA_SAVER) "dataSaver" else "data",
 		)
 		val prefix = "${json.getString("baseUrl")}/$server/${chapterJson.getString("hash")}/"
+		val dataSaverPages = chapterJson.optJSONArray("dataSaver")
+		val dataSaverPrefix = "${json.getString("baseUrl")}/$SERVER_DATA_SAVER/${chapterJson.getString("hash")}/"
 		return List(pages.length()) { i ->
 			val url = prefix + pages.getString(i)
+			val previewUrl = if (server == SERVER_DATA_SAVER) {
+				null
+			} else {
+				dataSaverPages?.optString(i)?.nullIfEmpty()?.let { dataSaverPrefix + it }
+			}
 			MangaPage(
 				id = generateUid(url),
 				url = url,
-				preview = null, // TODO prefix + dataSaver.getString(i),
+				preview = previewUrl,
 				source = source,
 			)
 		}
@@ -439,7 +446,7 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 			title = requireNotNull(attrs.getJSONObject("title").selectByLocale()) {
 				"Title should not be null"
 			},
-			altTitles = setOfNotNull(attrs.optJSONArray("altTitles")?.flatten()?.selectByLocale()), // TODO
+			altTitles = attrs.optJSONArray("altTitles")?.selectAltTitlesByLocale().orEmpty(),
 			url = id,
 			publicUrl = "https://$domain/title/$id",
 			rating = RATING_UNKNOWN,
@@ -486,14 +493,22 @@ internal class MangaDexParser(context: MangaLoaderContext) : FlexibleMangaParser
 		return getStringOrNull(LOCALE_FALLBACK) ?: entries<String>().firstOrNull()?.value?.nullIfEmpty()
 	}
 
-	private fun JSONArray.flatten(): JSONObject {
-		val result = JSONObject()
+	// altTitles is an array of single-entry {locale: title} objects; only keep entries whose
+	// locale matches the user's preferred locales (or the fallback locale) instead of every locale.
+	private fun JSONArray.selectAltTitlesByLocale(): Set<String> {
+		val allowedLocales = buildSet {
+			context.getPreferredLocales().forEach { locale ->
+				add(locale.language)
+				add(locale.toLanguageTag())
+			}
+			add(LOCALE_FALLBACK)
+		}
+		val result = LinkedHashSet<String>()
 		repeat(length()) { i ->
-			val jo = optJSONObject(i)
-			if (jo != null) {
-				for (key in jo.keys()) {
-					result.put(key, jo.get(key))
-				}
+			val jo = optJSONObject(i) ?: return@repeat
+			for (key in jo.keys()) {
+				if (key !in allowedLocales) continue
+				jo.getStringOrNull(key)?.nullIfEmpty()?.let { result.add(it) }
 			}
 		}
 		return result
