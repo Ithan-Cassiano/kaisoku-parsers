@@ -156,22 +156,40 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val slug = manga.url.removePrefix("/obra/").trimEnd('/')
-		val html = webClient.httpGet(manga.url.toAbsoluteUrl(domain), getRequestHeaders()).parseHtml().html()
-		val libraryObra = fetchObraFromLibrary(slug)
+		val pageUrl = manga.url.toAbsoluteUrl(domain)
+		val html = fetchRawHtml(pageUrl)
+		val doc = org.jsoup.Jsoup.parse(html, pageUrl)
 		val pageMeta = parseObraPageMetadata(html, slug)
 		val rsc = extractRscPayload(html)
+		val htmlChapters = parseChaptersFromHtml(doc, slug)
+		val libraryObra = if (htmlChapters.isEmpty()) fetchObraFromLibrary(slug) else null
+		val idMap = LinkedHashMap<String, String>()
+		libraryObra?.optJSONArray("recentChapters")?.let { recent ->
+			idMap.putAll(parseChapterIdMapFromJsonArray(recent))
+		}
+		idMap.putAll(parseChapterIdMapFromHtml(html))
+		if (!isTrapPayload(rsc)) {
+			idMap.putAll(parseChapterIdMapFromRsc(rsc))
+		}
 
+		val rscChapters = if (isTrapPayload(rsc)) {
+			emptyList()
+		} else {
+			parseChaptersFromRsc(rsc).filterNot { isTrapChapter(it) }
+		}
 		val totalChapters = libraryObra?.optInt("chapters", 0)?.takeIf { it > 0 }
 			?: pageMeta?.chapterTotal
 			?: 0
-		val recentChapters = libraryObra?.optJSONArray("recentChapters")
-		val chapterIdMap = getChapterIdMap(slug, html)
 		val chapters = when {
-			totalChapters > 0 -> buildChaptersFromLibrary(slug, totalChapters, recentChapters, chapterIdMap)
-			isTrapPayload(rsc) -> emptyList()
-			else -> parseChaptersFromRsc(rsc)
-				.filterNot { isTrapChapter(it) }
-				.ifEmpty { parseChaptersFromHtml(org.jsoup.Jsoup.parse(html, manga.url.toAbsoluteUrl(domain)), slug) }
+			htmlChapters.isNotEmpty() -> applyChapterIds(htmlChapters, idMap)
+			rscChapters.isNotEmpty() -> rscChapters
+			totalChapters > 0 -> buildChaptersFromLibrary(
+				slug,
+				totalChapters,
+				libraryObra?.optJSONArray("recentChapters"),
+				idMap,
+			)
+			else -> emptyList()
 		}.sortedBy { it.number }
 
 		if (chapters.isEmpty() && pageMeta == null && libraryObra == null) {
@@ -187,7 +205,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val description = if (isTrapPayload(rsc)) {
 			manga.description?.takeUnless { isTrapDescription(it) }
 		} else {
-			org.jsoup.Jsoup.parse(html).selectFirst("meta[property=og:description]")?.attr("content")
+			doc.selectFirst("meta[property=og:description]")?.attr("content")
 				?.takeUnless { it.isBlank() || isTrapDescription(it) }
 				?: extractJsonString(rsc, "description")?.takeUnless { isTrapDescription(it) }
 				?: manga.description?.takeUnless { isTrapDescription(it) }
@@ -215,17 +233,9 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		}
 		val match = CHAPTER_URL_REGEX.matchEntire(chapter.url)
 		if (match != null) {
-			val slug = resolveObraSlug(match.groupValues[1])
-			val chapterNumber = match.groupValues[2]
-			resolveChapterId(slug, chapterNumber)?.let { chapterId ->
-				tryFetchPagesFromApi("/api/chapters?id=$chapterId").takeIf { it.isNotEmpty() }?.let { return it }
-			}
-			fetchPagesFromReader(slug, chapterNumber).takeIf { it.isNotEmpty() }?.let { return it }
-		} else if (chapter.url.startsWith("/api/chapters")) {
-			val chapterId = chapter.url.substringAfter("id=", "").substringBefore('&')
-			if (chapterId.isNotBlank()) {
-				fetchPagesFromReaderByChapterId(chapterId, chapter.number)?.takeIf { it.isNotEmpty() }?.let { return it }
-			}
+			fetchPagesFromReader(match.groupValues[1], match.groupValues[2])
+				.takeIf { it.isNotEmpty() }
+				?.let { return it }
 		}
 		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
 	}
@@ -282,11 +292,15 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchPagesFromReader(slug: String, chapterNumber: String): List<MangaPage> {
-		resolveChapterIdFromReader(slug, chapterNumber)?.let { chapterId ->
+		val rawHtml = fetchRawHtml("https://$domain/ler/$slug/$chapterNumber")
+		parsePagesFromReaderHtml(rawHtml).takeIf { it.isNotEmpty() }?.let { return it }
+		extractChapterIdFromReader(rawHtml, chapterNumber)?.let { chapterId ->
 			tryFetchPagesFromApi("/api/chapters?id=$chapterId").takeIf { it.isNotEmpty() }?.let { return it }
 		}
+		return emptyList()
+	}
 
-		val rawHtml = fetchRawHtml("https://$domain/ler/$slug/$chapterNumber")
+	private fun parsePagesFromReaderHtml(rawHtml: String): List<MangaPage> {
 		val urls = LinkedHashSet<String>()
 		PRELOAD_IMAGE_REGEX.findAll(rawHtml).forEach { match ->
 			if (!isTrapAsset(match.groupValues[1])) {
@@ -321,92 +335,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		}
 	}
 
-	private suspend fun fetchPagesFromReaderByChapterId(chapterId: String, chapterNumber: Float): List<MangaPage>? {
-		tryFetchPagesFromApi("/api/chapters?id=$chapterId").takeIf { it.isNotEmpty() }?.let { return it }
+	private fun extractChapterIdFromReader(html: String, chapterNumber: String): String? {
+		for (pattern in READER_CHAPTER_ID_PATTERNS) {
+			val regex = Regex(pattern.replace("%NUM%", Regex.escape(chapterNumber)))
+			regex.find(html)?.groupValues?.get(1)?.let { id ->
+				if (!isTrapChapterId(id)) {
+					return id
+				}
+			}
+		}
 		return null
-	}
-
-	private suspend fun resolveObraSlug(slug: String): String {
-		if (getChapterIdMap(slug).isNotEmpty()) {
-			return slug
-		}
-		val query = slug.replace('-', ' ').urlEncoded()
-		val json = webClient.httpGet(
-			"https://$domain/api/library?search=$query&limit=20",
-			getApiHeaders(),
-		).parseJson()
-		val arr = json.optLibraryArray() ?: return slug
-		for (i in 0 until arr.length()) {
-			val obra = arr.optJSONObject(i) ?: continue
-			val candidate = obra.optString("slug")
-			if (candidate.isBlank()) continue
-			if (candidate == slug || slugSimilar(slug, candidate)) {
-				chapterIdCache.remove(slug)
-				return candidate
-			}
-		}
-		return slug
-	}
-
-	private fun slugSimilar(requested: String, candidate: String): Boolean {
-		if (requested == candidate) return true
-		if (requested.length < 8 || candidate.length < 8) return false
-		val minLen = minOf(requested.length, candidate.length)
-		var same = 0
-		for (i in 0 until minLen) {
-			if (requested[i] == candidate[i]) same++
-		}
-		return same >= minLen - 2
-	}
-
-	private suspend fun resolveChapterId(slug: String, chapterNumber: String): String? {
-		getChapterIdMap(slug)[chapterNumber]?.let { return it }
-		val json = webClient.httpGet(
-			"https://$domain/api/library?search=${slug.replace('-', ' ').urlEncoded()}&limit=20",
-			getApiHeaders(),
-		).parseJson()
-		val arr = json.optLibraryArray() ?: return resolveChapterIdFromReader(slug, chapterNumber)
-		for (i in 0 until arr.length()) {
-			val obra = arr.optJSONObject(i) ?: continue
-			if (obra.optString("slug") != slug) continue
-			val recent = obra.optJSONArray("recentChapters") ?: break
-			for (j in 0 until recent.length()) {
-				val ch = recent.optJSONObject(j) ?: continue
-				if (ch.optString("number") == chapterNumber) {
-					return ch.getStringOrNull("id")
-				}
-			}
-			break
-		}
-		return resolveChapterIdFromReader(slug, chapterNumber)
-	}
-
-	private suspend fun getChapterIdMap(slug: String, obraHtml: String? = null): Map<String, String> {
-		chapterIdCache[slug]?.let { return it }
-		val map = LinkedHashMap<String, String>()
-		val libraryObra = fetchObraFromLibrary(slug)
-		libraryObra?.optJSONArray("recentChapters")?.let { recent ->
-			map.putAll(parseChapterIdMapFromJsonArray(recent))
-		}
-		val html = obraHtml ?: fetchRawHtml("https://$domain/obra/$slug")
-		map.putAll(parseChapterIdMapFromHtml(html))
-		if (map.isEmpty()) {
-			val rsc = extractRscPayload(html)
-			if (!isTrapPayload(rsc)) {
-				map.putAll(parseChapterIdMapFromRsc(rsc))
-				parseChaptersFromRsc(rsc).forEach { ch ->
-					if (!isTrapChapter(ch)) {
-						val numKey = chapterNumberKey(ch.number)
-						val id = ch.url.removePrefix("/api/chapters?id=")
-						if (id.isNotBlank() && !isTrapChapterId(id)) {
-							map.putIfAbsent(numKey, id)
-						}
-					}
-				}
-			}
-		}
-		chapterIdCache[slug] = map
-		return map
 	}
 
 	private fun parseChapterIdMapFromJsonArray(array: JSONArray): Map<String, String> {
@@ -437,7 +375,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchObraFromLibrary(slug: String): JSONObject? {
-		buildLibrarySearchQueries(slug).forEach { query ->
+		val queries = linkedSetOf(slug.replace('-', ' '), slug).filter { it.isNotBlank() }
+		for (query in queries) {
 			findObraInLibraryResponse(
 				webClient.httpGet(
 					"https://$domain/api/library?search=${query.urlEncoded()}&limit=20",
@@ -446,27 +385,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				slug,
 			)?.let { return it }
 		}
-		for (page in 1..5) {
-			findObraInLibraryResponse(
-				webClient.httpGet(
-					"https://$domain/api/library?page=$page&limit=50&sort=recent",
-					getApiHeaders(),
-				).parseJson(),
-				slug,
-			)?.let { return it }
-		}
 		return null
-	}
-
-	private fun buildLibrarySearchQueries(slug: String): List<String> {
-		val words = slug.split('-').filter { it.isNotBlank() }
-		val queries = LinkedHashSet<String>()
-		queries.add(slug.replace('-', ' '))
-		queries.add(slug)
-		for (size in 2..minOf(4, words.size)) {
-			queries.add(words.takeLast(size).joinToString(" "))
-		}
-		return queries.toList()
 	}
 
 	private fun findObraInLibraryResponse(json: JSONObject, slug: String): JSONObject? {
@@ -478,6 +397,22 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			}
 		}
 		return null
+	}
+
+	private fun applyChapterIds(
+		chapters: List<MangaChapter>,
+		idMap: Map<String, String>,
+	): List<MangaChapter> {
+		if (idMap.isEmpty()) return chapters
+		return chapters.map { chapter ->
+			val id = idMap[chapterNumberKey(chapter.number)]
+				?: chapter.number.toInt().takeIf { it.toFloat() == chapter.number }?.toString()?.let(idMap::get)
+			if (id.isNullOrBlank()) {
+				chapter
+			} else {
+				chapter.copy(url = "/api/chapters?id=$id")
+			}
+		}
 	}
 
 	private fun parseObraPageMetadata(html: String, slug: String): ObraPageMetadata? {
@@ -546,36 +481,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
-	}
-
-	private suspend fun fetchChaptersFallback(slug: String): List<MangaChapter> {
-		val response = webClient.httpGet("https://$domain/obra/$slug", getRequestHeaders())
-		if (!response.isSuccessful) {
-			response.close()
-			return emptyList()
-		}
-		val doc = response.parseHtml()
-		val rsc = extractRscPayload(doc.html())
-		response.close()
-		if (isTrapPayload(rsc)) {
-			return emptyList()
-		}
-		return parseChaptersFromRsc(rsc)
-			.filterNot { isTrapChapter(it) }
-			.ifEmpty { parseChaptersFromHtml(doc, slug) }
-	}
-
-	private suspend fun resolveChapterIdFromReader(slug: String, chapterNumber: String): String? {
-		val html = fetchRawHtml("https://$domain/ler/$slug/$chapterNumber")
-		for (pattern in READER_CHAPTER_ID_PATTERNS) {
-			val regex = Regex(pattern.replace("%NUM%", Regex.escape(chapterNumber)))
-			regex.find(html)?.groupValues?.get(1)?.let { id ->
-				if (!isTrapChapterId(id)) {
-					return id
-				}
-			}
-		}
-		return null
 	}
 
 	private fun buildYmReqToken(chapterId: String): String {
@@ -690,8 +595,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		}
 	}
 
-	private val chapterIdCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
-
 	private val tagsCache = suspendLazy(initializer = ::loadTags)
 
 	private suspend fun fetchTags(): Set<MangaTag> = tagsCache.get()
@@ -804,13 +707,17 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	private fun org.json.JSONObject.optEncodedLibraryArray(key: String): org.json.JSONArray? {
 		val encoded = optString(key).takeUnless { it.isBlank() } ?: return null
-		return runCatching {
-			org.json.JSONArray(context.decodeBase64(encoded).toString(Charsets.UTF_8))
-		}.getOrNull()
+		val decrypted = runCatching {
+			CryptoAES(context).decrypt(encoded, LIBRARY_AES_PASSWORD)
+		}.getOrNull() ?: runCatching {
+			context.decodeBase64(encoded).toString(Charsets.UTF_8)
+		}.getOrNull() ?: return null
+		return runCatching { org.json.JSONArray(decrypted) }.getOrNull()
 	}
 
 	private companion object {
 		private const val ACCEPT_LANGUAGE = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+		private const val LIBRARY_AES_PASSWORD = "yomu_trolling_scrapers_v1"
 		private val ymReqDateFormat = SimpleDateFormat("yyyyMMdd", Locale.US).apply {
 			timeZone = TimeZone.getTimeZone("UTC")
 		}
