@@ -203,17 +203,6 @@ internal class BlackoutComics(context: MangaLoaderContext) :
 	private val parserUserAgent: String
 		get() = config[userAgentKey]
 
-	private suspend fun requireAuthorized() {
-		if (!isAuthorized()) {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException(
-					"Faça login em Configurações → Fontes → Blackout Comics → Entrar na conta e use \"Confirmar login\".",
-				),
-			)
-		}
-	}
-
 	override suspend fun getUsername(): String {
 		if (!isAuthorized()) {
 			throw AuthRequiredException(source)
@@ -374,13 +363,8 @@ internal class BlackoutComics(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val (projectId, chapterId) = parseChapterRef(chapter.url)
-		requireAuthorized()
 
-		val doc = if (config[authSessionKey]) {
-			fetchProjectDocument(projectId, preferWebView = true)
-		} else {
-			null
-		}
+		val doc = fetchProjectDocument(projectId, preferWebView = config[authSessionKey])
 
 		if (doc != null && isChapterLoginRequired(doc, chapterId)) {
 			throw AuthRequiredException(
