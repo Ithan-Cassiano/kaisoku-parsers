@@ -1,5 +1,7 @@
 package com.kosen.reader.parsers.site.pt
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
@@ -41,6 +43,10 @@ internal open class PlumaComicsParser(
 
 	@Volatile
 	private var cachedTags: Set<MangaTag>? = null
+	private val chapterFeedMutex = Mutex()
+	private val chapterFeedCache = HashMap<String, List<MangaChapter>>()
+	private var chapterFeedSkip = 0
+	private var chapterFeedComplete = false
 
 	override val configKeyDomain = ConfigKey.Domain(defaultDomain)
 
@@ -209,28 +215,47 @@ internal open class PlumaComicsParser(
 	}
 
 	private suspend fun fetchChapters(slug: String): List<MangaChapter> {
-		// /api/manga/{id}/chapters exige sessão e o httpGet trata 401 como erro de rede.
-		val updates = webClient.httpGet(
-			"https://$domain/api/latest-updates?take=60",
-			getApiHeaders(),
-		).parseJson()
-		val items = updates.optJSONArray("items") ?: return emptyList()
-		for (i in 0 until items.length()) {
-			val item = items.optJSONObject(i) ?: continue
-			if (item.optJSONObject("series")?.optString("slug") != slug) continue
-			return parseChapterList(item.optJSONArray("chapters") ?: JSONArray())
+		chapterFeedCache[slug]?.let { return it }
+		return chapterFeedMutex.withLock {
+			chapterFeedCache[slug]?.let { return@withLock it }
+			while (!chapterFeedComplete) {
+				val updates = webClient.httpGet(
+					"https://$domain/api/latest-updates?take=60&skip=$chapterFeedSkip",
+					getApiHeaders(),
+				).parseJson()
+				val items = updates.optJSONArray("items") ?: JSONArray()
+				if (items.length() == 0 || chapterFeedSkip >= 1200) {
+					chapterFeedComplete = true
+					break
+				}
+				var added = 0
+				for (i in 0 until items.length()) {
+					val item = items.optJSONObject(i) ?: continue
+					val itemSlug = item.optJSONObject("series")?.optString("slug").orEmpty()
+					if (itemSlug.isBlank() || chapterFeedCache.containsKey(itemSlug)) continue
+					chapterFeedCache[itemSlug] = parseChapterList(item.optJSONArray("chapters") ?: JSONArray())
+					added++
+				}
+				chapterFeedSkip += items.length()
+				if (added == 0 || items.length() < 60) {
+					chapterFeedComplete = true
+				}
+				chapterFeedCache[slug]?.let { return@withLock it }
+			}
+			chapterFeedCache[slug].orEmpty()
 		}
-		return emptyList()
 	}
 
 	private fun parseChapterList(array: JSONArray): List<MangaChapter> {
 		return array.mapJSONNotNull { json ->
-			if (json.optBoolean("isVipOnly", false)) {
+			if (json.optBoolean("isVipOnly", false) || json.optBoolean("isVipOnly", false)) {
 				return@mapJSONNotNull null
 			}
 			val id = json.opt("id")?.toString()?.nullIfEmpty() ?: return@mapJSONNotNull null
 			val number = json.opt("number")?.toString()?.toFloatOrNull() ?: 0f
 			val href = "/ler/$id"
+			val publishedAt = json.getStringOrNull("publishedAt")
+				?: json.getStringOrNull("publishedAt")
 			MangaChapter(
 				id = generateUid(href),
 				title = null,
@@ -239,7 +264,7 @@ internal open class PlumaComicsParser(
 				url = href,
 				scanlator = null,
 				uploadDate = isoDateFormat.parseSafe(
-					json.getStringOrNull("publishedAt")?.substringBefore('.')?.substringBefore('Z'),
+					publishedAt?.substringBefore('.')?.substringBefore('Z'),
 				),
 				branch = null,
 				source = source,
@@ -308,6 +333,7 @@ internal open class PlumaComicsParser(
 			}.toSet()
 		}.orEmpty()
 		val coverPath = json.getStringOrNull("coverPath")
+			?: json.getStringOrNull("coverPath")
 		return Manga(
 			id = generateUid(json.optInt("id", 0).takeIf { it > 0 }?.toString() ?: href),
 			title = json.getStringOrNull("title").orEmpty(),

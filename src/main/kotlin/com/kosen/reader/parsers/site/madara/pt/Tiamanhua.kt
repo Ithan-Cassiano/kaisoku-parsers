@@ -7,41 +7,51 @@ import com.kosen.reader.parsers.model.MangaListFilter
 import com.kosen.reader.parsers.model.MangaParserSource
 import com.kosen.reader.parsers.model.SortOrder
 import com.kosen.reader.parsers.site.madara.MadaraParser
+import com.kosen.reader.parsers.util.oneOrThrowIfMany
 import com.kosen.reader.parsers.util.parseHtml
 
 @MangaSourceParser("TIAMANHUA", "TiaManhua", "pt", ContentType.HENTAI)
 internal class Tiamanhua(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.TIAMANHUA, "tiamanhwa.com", pageSize = 24) {
+	MadaraParser(context, MangaParserSource.TIAMANHUA, "tiamanhwa.com", pageSize = 18) {
 
 	override val listUrl = "manhwa/"
+	override val tagPrefix = "tag-manhwa/"
 	override val datePattern = "dd/MM/yyyy"
+	override val withoutAjax = true
 	override val selectChapter = "li.wp-manga-chapter, li.chapter-item, div.chapter, div.wp-manga-chapter"
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter) =
-		if (shouldUseArchiveListing(filter, order)) {
-			parseMangaList(
-				webClient.httpGet(buildArchiveListingUrl(page)).parseHtml(),
-			)
-		} else {
+		if (needsSearchEndpoint(filter)) {
 			super.getListPage(page, order, filter)
+		} else {
+			parseMangaList(webClient.httpGet(buildArchiveUrl(page, filter)).parseHtml())
 		}
 
-	private fun shouldUseArchiveListing(filter: MangaListFilter, order: SortOrder): Boolean =
-		order == SortOrder.UPDATED &&
-			filter.query.isNullOrEmpty() &&
-			filter.tags.isEmpty() &&
-			filter.tagsExclude.isEmpty() &&
-			filter.states.isEmpty() &&
-			filter.year == 0 &&
-			filter.author.isNullOrEmpty() &&
-			filter.contentRating == null
+	private fun needsSearchEndpoint(filter: MangaListFilter): Boolean =
+		!filter.query.isNullOrEmpty() ||
+			filter.states.isNotEmpty() ||
+			filter.contentRating != null ||
+			filter.year != 0 ||
+			!filter.author.isNullOrEmpty()
 
-	private fun buildArchiveListingUrl(page: Int): String {
+	private fun buildArchiveUrl(page: Int, filter: MangaListFilter): String {
 		val pageNum = page + 1
-		return if (pageNum <= 1) {
-			"https://$domain/"
-		} else {
-			"https://$domain/page/$pageNum/"
+		return buildString {
+			append("https://")
+			append(domain)
+			append('/')
+			if (filter.tags.isNotEmpty()) {
+				append(tagPrefix)
+				append(filter.tags.oneOrThrowIfMany()?.key)
+				append('/')
+			} else {
+				append(listUrl)
+			}
+			if (pageNum > 1) {
+				append("page/")
+				append(pageNum)
+				append('/')
+			}
 		}
 	}
 }

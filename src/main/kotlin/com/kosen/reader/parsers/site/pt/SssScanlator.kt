@@ -77,55 +77,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val url = buildString {
-			append("https://")
-			append(domain)
-			append("/api/library?page=")
-			append(page.toString())
-			append("&limit=")
-			append(pageSize.toString())
-			append("&sort=")
-			append(
-				when (order) {
-					SortOrder.UPDATED -> "recent"
-					SortOrder.POPULARITY -> "popular"
-					SortOrder.ALPHABETICAL -> "title"
-					else -> "recent"
-				},
-			)
-			if (!filter.query.isNullOrEmpty()) {
-				append("&search=")
-				append(filter.query.urlEncoded())
-			}
-			filter.tags.firstOrNull()?.let { tag ->
-				append("&genre=")
-				append(tag.key.urlEncoded())
-			}
-			filter.states.oneOrThrowIfMany()?.let { state ->
-				append("&status=")
-				append(
-					when (state) {
-						MangaState.ONGOING -> "Ongoing"
-						MangaState.FINISHED -> "Completed"
-						MangaState.PAUSED -> "Hiatus"
-						else -> ""
-					},
-				)
-			}
-			filter.types.oneOrThrowIfMany()?.let { type ->
-				append("&type=")
-				append(
-					when (type) {
-						ContentType.MANGA -> "manga"
-						ContentType.MANHWA -> "manhwa"
-						ContentType.MANHUA -> "manhua"
-						else -> ""
-					},
-				)
-			}
-		}
-
-		val json = webClient.httpGet(url, getApiHeaders()).parseJson()
+		val json = fetchLibraryJson(page, order, filter)
 		val data = json.optLibraryArray() ?: return emptyList()
 		return data.mapJSONNotNull { obj ->
 			val slug = obj.getString("slug")
@@ -164,7 +116,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val htmlChapters = parseChaptersFromHtml(doc, slug)
 		val libraryObra = if (htmlChapters.isEmpty()) fetchObraFromLibrary(slug) else null
 		val idMap = LinkedHashMap<String, String>()
-		libraryObra?.optJSONArray("recentChapters")?.let { recent ->
+		(libraryObra?.optJSONArray("recentChapters") ?: libraryObra?.optJSONArray("recentChapters"))?.let { recent ->
 			idMap.putAll(parseChapterIdMapFromJsonArray(recent))
 		}
 		idMap.putAll(parseChapterIdMapFromHtml(html))
@@ -186,7 +138,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			totalChapters > 0 -> buildChaptersFromLibrary(
 				slug,
 				totalChapters,
-				libraryObra?.optJSONArray("recentChapters"),
+				libraryObra?.optJSONArray("recentChapters")
+					?: libraryObra?.optJSONArray("recentChapters"),
 				idMap,
 			)
 			else -> emptyList()
@@ -374,14 +327,77 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return map
 	}
 
+	private suspend fun fetchLibraryJson(page: Int, order: SortOrder, filter: MangaListFilter): JSONObject {
+		val params = buildLibraryParams(page, order, filter)
+		return runCatching {
+			webClient.httpGet("https://$domain/api/library-proxy?$params", getApiHeaders()).parseJson()
+		}.getOrElse {
+			webClient.httpGet("https://$domain/api/library?$params", getApiHeaders()).parseJson()
+		}
+	}
+
+	private fun buildLibraryParams(page: Int, order: SortOrder, filter: MangaListFilter): String = buildString {
+		append("page=")
+		append(page.toString())
+		append("&limit=")
+		append(pageSize.toString())
+		append("&sort=")
+		append(
+			when (order) {
+				SortOrder.UPDATED -> "recent"
+				SortOrder.POPULARITY -> "popular"
+				SortOrder.ALPHABETICAL -> "alphabetical"
+				else -> "recent"
+			},
+		)
+		if (!filter.query.isNullOrEmpty()) {
+			append("&search=")
+			append(filter.query.urlEncoded())
+		}
+		filter.tags.firstOrNull()?.let { tag ->
+			append("&genre=")
+			append(tag.key.urlEncoded())
+		}
+		filter.states.oneOrThrowIfMany()?.let { state ->
+			append("&status=")
+			append(
+				when (state) {
+					MangaState.ONGOING -> "ONGOING"
+					MangaState.FINISHED -> "COMPLETED"
+					MangaState.PAUSED -> "HIATUS"
+					else -> ""
+				},
+			)
+		}
+		filter.types.oneOrThrowIfMany()?.let { type ->
+			append("&type=")
+			append(
+				when (type) {
+					ContentType.MANGA -> "manga"
+					ContentType.MANHWA -> "manhwa"
+					ContentType.MANHUA -> "manhua"
+					else -> ""
+				},
+			)
+		}
+	}
+
 	private suspend fun fetchObraFromLibrary(slug: String): JSONObject? {
 		val queries = linkedSetOf(slug.replace('-', ' '), slug).filter { it.isNotBlank() }
 		for (query in queries) {
+			val encoded = query.urlEncoded()
 			findObraInLibraryResponse(
-				webClient.httpGet(
-					"https://$domain/api/library?search=${query.urlEncoded()}&limit=20",
-					getApiHeaders(),
-				).parseJson(),
+				runCatching {
+					webClient.httpGet(
+						"https://$domain/api/library-proxy?search=$encoded&limit=20",
+						getApiHeaders(),
+					).parseJson()
+				}.getOrElse {
+					webClient.httpGet(
+						"https://$domain/api/library?search=$encoded&limit=20",
+						getApiHeaders(),
+					).parseJson()
+				},
 				slug,
 			)?.let { return it }
 		}
@@ -697,13 +713,14 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private fun org.json.JSONObject.optLibraryArray(): org.json.JSONArray? =
-		optJSONArray("prateleira")
+		optJSONArray("garimpo")
+			?: optJSONArray("prateleira")
 			?: optJSONArray("acervo")
 			?: optJSONArray("obras")
 			?: optJSONArray("data")
+			?: optJSONArray("catalogo")
 			?: optEncodedLibraryArray("garimpo")
 			?: optEncodedLibraryArray("catalogo")
-			?: optJSONArray("catalogo")
 
 	private fun org.json.JSONObject.optEncodedLibraryArray(key: String): org.json.JSONArray? {
 		val encoded = optString(key).takeUnless { it.isBlank() } ?: return null
