@@ -4,11 +4,11 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
-import com.kosen.reader.parsers.Broken
 import com.kosen.reader.parsers.MangaLoaderContext
 import com.kosen.reader.parsers.MangaSourceParser
 import com.kosen.reader.parsers.config.ConfigKey
 import com.kosen.reader.parsers.core.PagedMangaParser
+import com.kosen.reader.parsers.exception.AuthRequiredException
 import com.kosen.reader.parsers.exception.ParseException
 import com.kosen.reader.parsers.model.ContentRating
 import com.kosen.reader.parsers.model.ContentType
@@ -25,13 +25,17 @@ import com.kosen.reader.parsers.model.RATING_UNKNOWN
 import com.kosen.reader.parsers.model.SortOrder
 import com.kosen.reader.parsers.network.UserAgents
 import com.kosen.reader.parsers.util.generateUid
+import com.kosen.reader.parsers.util.getCookies
 import com.kosen.reader.parsers.util.json.mapJSON
 import com.kosen.reader.parsers.util.json.mapJSONNotNull
 import com.kosen.reader.parsers.util.parseJson
+import com.kosen.reader.parsers.util.parseSafe
 import com.kosen.reader.parsers.util.toTitleCase
+import java.text.SimpleDateFormat
 import java.util.EnumSet
+import java.util.Locale
+import java.util.TimeZone
 
-@Broken("Leitura indisponível via API pública")
 @MangaSourceParser("VERDINHA", "Verdinha", "pt")
 internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 	context,
@@ -78,16 +82,53 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 		)
 	}
 
-	private fun apiHeaders(scanId: Int = defaultScanId): Headers = Headers.Builder()
-		.add("User-Agent", UserAgents.CHROME_MOBILE)
-		.add("Accept", "application/json, text/plain, */*")
-		.add("Origin", "https://$domain")
-		.add("Referer", "https://$domain/")
-		.add("scan-id", scanId.toString())
-		.build()
+	private fun apiHeaders(scanId: Int = defaultScanId): Headers {
+		val builder = Headers.Builder()
+			.add("User-Agent", UserAgents.CHROME_MOBILE)
+			.add("Accept", "application/json, text/plain, */*")
+			.add("Origin", "https://$domain")
+			.add("Referer", "https://$domain/")
+			.add("scan-id", scanId.toString())
+		resolveAccessToken()?.let { token ->
+			builder.add("Authorization", "Bearer $token")
+		}
+		return builder.build()
+	}
+
+	private fun resolveAccessToken(): String? {
+		val cookies = context.cookieJar.getCookies(domain) +
+			context.cookieJar.getCookies("api.$domain")
+		return cookies.firstOrNull { cookie ->
+			cookie.name.equals("access_token", ignoreCase = true) && cookie.value.isNotBlank()
+		}?.value
+	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val url = buildSearchUrl(page, filter, order)
+		val url = when {
+			!filter.query.isNullOrEmpty() || filter.tags.isNotEmpty() ||
+				filter.states.isNotEmpty() || filter.types.isNotEmpty() -> buildSearchUrl(page, filter, order)
+
+			order in setOf(
+				SortOrder.POPULARITY,
+				SortOrder.POPULARITY_TODAY,
+				SortOrder.POPULARITY_WEEK,
+				SortOrder.POPULARITY_MONTH,
+			) -> {
+				val period = when (order) {
+					SortOrder.POPULARITY_TODAY -> "dia"
+					SortOrder.POPULARITY_WEEK -> "semana"
+					SortOrder.POPULARITY_MONTH -> "mes"
+					else -> "geral"
+				}
+				"$apiUrl/obras/ranking".toHttpUrl().newBuilder()
+					.addQueryParameter("periodo", period)
+					.addQueryParameter("limite", pageSize.toString())
+					.addQueryParameter("pagina", page.toString())
+					.build()
+			}
+
+			else -> buildSearchUrl(page, filter, order)
+		}
 		val response = webClient.httpGet(url, apiHeaders()).parseJson()
 		val results = response.optJSONArray("obras") ?: return emptyList()
 		return results.mapJSON { parseMangaFromJson(it) }
@@ -206,17 +247,8 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 			?.optString("stt_nome")
 			?.let { parseStatus(it) }
 
-		val tags = mangaJson.optJSONArray("tags")?.mapJSON { tagJson ->
-			val tagName = tagJson.optString("tag_nome").ifEmpty {
-				tagJson.optString("nome", "")
-			}
-			val tagId = tagJson.optInt("tag_id").takeIf { it != 0 }
-				?: tagJson.optInt("id", 0)
-			MangaTag(
-				key = tagId.toString(),
-				title = tagName.toTitleCase(),
-				source = source,
-			)
+		val tags = mangaJson.optJSONArray("tags")?.mapJSONNotNull { tagJson ->
+			parseTag(tagJson)
 		}?.toSet() ?: emptySet()
 
 		val chapters = mangaJson.optJSONArray("capitulos")?.mapJSON { chapterJson ->
@@ -236,13 +268,14 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 		val chapterId = json.getInt("cap_id")
 		val chapterName = json.getString("cap_nome")
 		val chapterNumber = json.optDouble("cap_numero").toFloat()
+		val uploadDate = parseIsoDate(json.optString("cap_criado_em").ifBlank { json.optString("cap_liberar_em") })
 
 		return MangaChapter(
 			id = generateUid(chapterId.toLong()),
 			title = chapterName,
 			number = chapterNumber,
 			url = "/capitulo/$chapterId/$obraId/$scanId",
-			uploadDate = 0,
+			uploadDate = uploadDate,
 			source = source,
 			volume = 0,
 			scanlator = null,
@@ -274,7 +307,15 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 
 		val chapterData = runCatching {
 			webClient.httpGet("$apiUrl/capitulos/$chapterId", apiHeaders(scanId)).parseJson()
-		}.getOrNull()
+		}.getOrElse { error ->
+			val message = error.message.orEmpty()
+			if (message.contains("403") || message.contains("autenticado", ignoreCase = true) || message.contains("VIP", ignoreCase = true)) {
+				val probed = probeChapterPages(scanId, obraId, chapter.number)
+				if (probed.isNotEmpty()) return probed
+				throw AuthRequiredException(source, error)
+			}
+			null
+		}
 
 		if (chapterData != null) {
 			val capNumero = chapterData.optDouble("cap_numero").toFloat()
@@ -295,7 +336,14 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 			return probed
 		}
 
-		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
+		throw ParseException(
+			if (resolveAccessToken() == null) {
+				"Faça login na Verdinha pelo navegador do app (conta VIP) para ler os capítulos."
+			} else {
+				"Não foi possível carregar as páginas do capítulo. A leitura na Verdinha exige VIP ativo."
+			},
+			chapter.url,
+		)
 	}
 
 	private fun parsePageFromJson(
@@ -384,24 +432,48 @@ internal class Verdinha(context: MangaLoaderContext) : PagedMangaParser(
 		return if (number == intValue.toFloat()) {
 			intValue.toString()
 		} else {
-			number.toString()
+			number.toString().replace('.', '_')
 		}
 	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val response = webClient.httpGet("$apiUrl/tags", apiHeaders()).parseJson()
-		val tagsArray = response.optJSONArray("resultados") ?: return emptySet()
-		return tagsArray.mapJSON { tagJson ->
-			val tagName = tagJson.optString("tag_nome").ifEmpty {
-				tagJson.optString("nome", "")
-			}
-			val tagId = tagJson.optInt("tag_id").takeIf { it != 0 }
-				?: tagJson.optInt("id", 0)
-			MangaTag(
-				key = tagId.toString(),
-				title = tagName.toTitleCase(),
-				source = source,
-			)
+		val response = webClient.httpGet("$apiUrl/tags?limite=500", apiHeaders()).parseJson()
+		val tagsArray = response.optJSONArray("resultados")
+			?: response.optJSONArray("tags")
+			?: return emptySet()
+		return tagsArray.mapJSONNotNull { tagJson ->
+			parseTag(tagJson)
 		}.toSet()
+	}
+
+	private fun parseTag(tagJson: JSONObject): MangaTag? {
+		val nested = tagJson.optJSONObject("tag") ?: tagJson
+		val tagName = nested.optString("tag_nome").ifEmpty {
+			nested.optString("nome", "")
+		}.ifEmpty {
+			tagJson.optString("tag_nome").ifEmpty { tagJson.optString("nome", "") }
+		}
+		if (tagName.isBlank()) return null
+		val tagId = nested.optInt("tag_id").takeIf { it != 0 }
+			?: nested.optInt("id", 0).takeIf { it != 0 }
+			?: tagJson.optInt("tag_id").takeIf { it != 0 }
+			?: tagJson.optInt("id", 0)
+		return MangaTag(
+			key = tagId.toString(),
+			title = tagName.toTitleCase(),
+			source = source,
+		)
+	}
+
+	private fun parseIsoDate(raw: String?): Long {
+		val value = raw?.trim().orEmpty()
+		if (value.isEmpty() || value == "null") return 0L
+		for (pattern in listOf("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", "yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd HH:mm:ss")) {
+			val parsed = SimpleDateFormat(pattern, Locale.US).apply {
+				if (pattern.contains("'Z'")) timeZone = TimeZone.getTimeZone("UTC")
+			}.parseSafe(value)
+			if (parsed > 0L) return parsed
+		}
+		return 0L
 	}
 }

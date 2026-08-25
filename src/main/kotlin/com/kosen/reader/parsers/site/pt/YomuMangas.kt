@@ -97,12 +97,22 @@ internal class YomuMangas(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val effectiveOrderBy = if (filter.isEmpty()) "updatedAt" else order.toApiOrderBy()
+		val preferredOrderBy = when {
+			filter.isEmpty() || order == SortOrder.UPDATED -> "last_update"
+			else -> order.toApiOrderBy()
+		}
+		val mangasArray = fetchMangaArray(page, preferredOrderBy, filter)
+			?: if (preferredOrderBy != "updatedAt") fetchMangaArray(page, "updatedAt", filter) else null
+			?: JSONArray()
+		return mangasArray.mapJSONNotNull { series -> parseMangaFromSeries(series) }
+	}
+
+	private suspend fun fetchMangaArray(page: Int, orderBy: String, filter: MangaListFilter): JSONArray? {
 		val url = "$apiUrl/mangas".toHttpUrl().newBuilder().apply {
 			addQueryParameter("query", filter.query.orEmpty())
 			addQueryParameter("page", page.toString())
 			addQueryParameter("limit", pageSize.toString())
-			addQueryParameter("orderBy", effectiveOrderBy)
+			addQueryParameter("orderBy", orderBy)
 
 			if (filter.tags.isNotEmpty()) {
 				addQueryParameter("genreIds", filter.tags.joinToString(",") { it.key })
@@ -122,13 +132,11 @@ internal class YomuMangas(context: MangaLoaderContext) :
 				addQueryParameter("adultContent", "true")
 			}
 		}.build()
-
-		val response = webClient.httpGet(url, getApiHeaders()).parseJson()
-		val mangasArray = response.optJSONArray("mangas")
+		val response = runCatching { webClient.httpGet(url, getApiHeaders()).parseJson() }.getOrNull()
+			?: return null
+		return response.optJSONArray("mangas")
 			?: response.optJSONArray("posts")
 			?: response.optJSONArray("data")
-			?: JSONArray()
-		return mangasArray.mapJSONNotNull { series -> parseMangaFromSeries(series) }
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
@@ -278,9 +286,6 @@ internal class YomuMangas(context: MangaLoaderContext) :
 
 	private suspend fun fetchChapters(series: JSONObject): List<MangaChapter> {
 		val seriesId = series.optInt("id", 0)
-		if (seriesId <= 0) {
-			return emptyList()
-		}
 		val seriesSlug = series.getStringOrNull("slug")
 		val seriesUrl = normalizeMangaUrl(
 			series.getStringOrNull("url")
@@ -288,9 +293,16 @@ internal class YomuMangas(context: MangaLoaderContext) :
 				?: seriesSlug?.let { "/mangas/$it/$seriesId" },
 		)
 
-		val chaptersResponse = webClient.httpGet("$apiUrl/mangas/$seriesId/chapters", getApiHeaders()).parseJson()
-		val chaptersArray = chaptersResponse.optJSONArray("chapters")
-			?: chaptersResponse.optJSONArray("data")
+		val chaptersResponse = if (seriesId > 0) {
+			runCatching {
+				webClient.httpGet("$apiUrl/mangas/$seriesId/chapters", getApiHeaders()).parseJson()
+			}.getOrNull()
+		} else {
+			null
+		}
+		val chaptersArray = chaptersResponse?.optJSONArray("chapters")
+			?: chaptersResponse?.optJSONArray("data")
+			?: series.optJSONArray("chapters")
 			?: JSONArray()
 
 		return chaptersArray.mapJSONNotNull { ch ->
@@ -305,12 +317,14 @@ internal class YomuMangas(context: MangaLoaderContext) :
 				id = ch.getLongOrDefault("id", generateUid(chapterUrl)),
 				title = title,
 				number = chapterNumber ?: 0f,
-				volume = 0,
+				volume = ch.optInt("volume", 0),
 				url = chapterUrl,
 				scanlator = null,
 				uploadDate = parseDate(
-					ch.getStringOrNull("createdAt")
+					ch.getStringOrNull("uploaded_at")
+						?: ch.getStringOrNull("createdAt")
 						?: ch.getStringOrNull("updatedAt")
+						?: ch.getStringOrNull("updated_at")
 						?: ch.getStringOrNull("date"),
 				),
 				branch = null,
@@ -554,7 +568,7 @@ internal class YomuMangas(context: MangaLoaderContext) :
 
 	private fun SortOrder.toApiOrderBy(): String = when (this) {
 		SortOrder.POPULARITY -> "totalViews"
-		SortOrder.UPDATED -> "updatedAt"
+		SortOrder.UPDATED -> "last_update"
 		SortOrder.NEWEST -> "createdAt"
 		SortOrder.ALPHABETICAL_DESC -> "postTitle"
 		else -> "totalViews"
