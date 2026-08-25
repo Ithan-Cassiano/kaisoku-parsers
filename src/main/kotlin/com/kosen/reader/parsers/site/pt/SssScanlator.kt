@@ -280,26 +280,26 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				filter.tags.firstOrNull()?.let { addQueryParameter("genre", it.key) }
 				filter.states.oneOrThrowIfMany()?.let { state ->
-					addQueryParameter(
-						"status",
-						when (state) {
-							MangaState.ONGOING -> "ONGOING"
-							MangaState.FINISHED -> "COMPLETED"
-							MangaState.PAUSED -> "HIATUS"
-							else -> return@let
-						},
-					)
+					val status = when (state) {
+						MangaState.ONGOING -> "ONGOING"
+						MangaState.FINISHED -> "COMPLETED"
+						MangaState.PAUSED -> "HIATUS"
+						else -> null
+					}
+					if (status != null) {
+						addQueryParameter("status", status)
+					}
 				}
 				filter.types.oneOrThrowIfMany()?.let { type ->
-					addQueryParameter(
-						"type",
-						when (type) {
-							ContentType.MANGA -> "MANGA"
-							ContentType.MANHWA -> "MANHWA"
-							ContentType.MANHUA -> "MANHUA"
-							else -> return@let
-						},
-					)
+					val typeValue = when (type) {
+						ContentType.MANGA -> "MANGA"
+						ContentType.MANHWA -> "MANHWA"
+						ContentType.MANHUA -> "MANHUA"
+						else -> null
+					}
+					if (typeValue != null) {
+						addQueryParameter("type", typeValue)
+					}
 				}
 			}
 			.build()
@@ -490,7 +490,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					const urls = [
 						...document.querySelectorAll('img[src*="cdn.yomu"], img[src*="cdn.monstercomics"], img[data-src*="cdn."]'),
 					].map(img => img.getAttribute('src') || img.getAttribute('data-src') || '')
-						.filter(src => /\.(webp|jpg|jpeg|png)(\?|$)/i.test(src));
+						.filter(src => /\.(webp|jpg|jpeg|png)(\?|${'$'})/i.test(src));
 					if (urls.length > 1) return JSON.stringify([...new Set(urls)]);
 					return null;
 				};

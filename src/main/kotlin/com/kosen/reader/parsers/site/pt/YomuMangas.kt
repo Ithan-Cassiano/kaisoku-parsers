@@ -102,7 +102,7 @@ internal class YomuMangas(context: MangaLoaderContext) :
 			else -> order.toApiOrderBy()
 		}
 		val mangasArray = fetchMangaArray(page, preferredOrderBy, filter)
-			?: if (preferredOrderBy != "updatedAt") fetchMangaArray(page, "updatedAt", filter) else null
+			?: (if (preferredOrderBy != "updatedAt") fetchMangaArray(page, "updatedAt", filter) else null)
 			?: JSONArray()
 		return mangasArray.mapJSONNotNull { series -> parseMangaFromSeries(series) }
 	}
