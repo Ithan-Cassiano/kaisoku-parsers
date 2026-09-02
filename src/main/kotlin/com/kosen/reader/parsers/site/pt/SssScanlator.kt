@@ -241,7 +241,13 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val match = CHAPTER_URL_REGEX.matchEntire(chapter.url.substringBefore('?'))
 		val chapterId = chapterApiId(chapter.url)
 		if (!chapterId.isNullOrBlank()) {
-			tryFetchPagesFromApi("/api/chapters?id=$chapterId").takeIf { it.isNotEmpty() }?.let { return it }
+			try {
+				return fetchPagesFromApi("/api/chapters?id=$chapterId")
+			} catch (e: ParseException) {
+				if (isTerminalChapterError(e.shortMessage)) throw e
+			} catch (_: Exception) {
+				// API recusou o HTTP; tenta o mesmo ID pelo WebView.
+			}
 		}
 		if (match != null) {
 			runCatching { fetchPagesViaJs(match.groupValues[1], match.groupValues[2], chapterId) }
@@ -293,11 +299,15 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				changed = true
 			}
 		}
-		return chain.proceed(if (changed) builder.build() else request)
+		val response = chain.proceed(if (changed) builder.build() else request)
+		if (path.contains("/api/chapters") && response.code in 400..499) {
+			val contentType = response.header("Content-Type").orEmpty()
+			if (contentType.contains("json", ignoreCase = true)) {
+				return response.newBuilder().code(200).message("OK").build()
+			}
+		}
+		return response
 	}
-
-	private suspend fun tryFetchPagesFromApi(chapterUrl: String): List<MangaPage> =
-		runCatching { fetchPagesFromApi(chapterUrl) }.getOrDefault(emptyList())
 
 	private fun getTaurusHeaders(): Headers = Headers.Builder()
 		.add("User-Agent", config[userAgentKey])
@@ -813,7 +823,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val pageUrl = if (knownId.isNullOrBlank()) {
 			"https://$domain/ler/$slug/$chapterNumber"
 		} else {
-			"https://$domain/ler/$slug/$chapterNumber?id=$knownId"
+			"https://$domain/obra/$slug"
 		}
 		val raw = evalYomuJs(pageUrl, script, timeout = 16000L) ?: return emptyList()
 		val value = parseJsValue(raw) ?: return emptyList()
@@ -859,13 +869,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			return emptyList()
 		}
 		json.optString("error").takeUnless { it.isBlank() || it.equals("null", true) }?.let { message ->
-			if (message.contains("fingerprint", ignoreCase = true) || message.contains("Forbidden", ignoreCase = true)) {
-				throw ParseException(message, chapterUrl)
-			}
-			throw ParseException(message, chapterUrl)
+			throw ParseException(chapterErrorMessage(message, json), chapterUrl)
 		}
-		if (json.optBoolean("isLocked")) {
-			throw ParseException("Este capítulo ainda não foi lançado ou está bloqueado.", chapterUrl)
+		if (json.optBoolean("isLocked") || json.optString("lockedType").equals("VIP", true)) {
+			throw ParseException(chapterErrorMessage(json.optString("error"), json), chapterUrl)
 		}
 		val chapter = json.optJSONObject("chapter")
 			?: throw ParseException("Resposta inválida da API de capítulos", chapterUrl)
@@ -890,6 +897,25 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			throw ParseException("Capítulo sem páginas", chapterUrl)
 		}
 		return result
+	}
+
+	private fun chapterErrorMessage(raw: String?, json: JSONObject): String {
+		val message = raw?.trim().orEmpty()
+		val locked = json.optBoolean("isLocked") || json.optString("lockedType").equals("VIP", true)
+		return when {
+			locked || message.contains("VIP", ignoreCase = true) ->
+				message.ifBlank { "Este capítulo é exclusivo para VIPs." }
+			message.isNotBlank() -> message
+			else -> "Não foi possível carregar as páginas do capítulo"
+		}
+	}
+
+	private fun isTerminalChapterError(message: String?): Boolean {
+		val text = message.orEmpty()
+		return text.contains("VIP", ignoreCase = true) ||
+			text.contains("bloqueado", ignoreCase = true) ||
+			text.contains("exclusivo", ignoreCase = true) ||
+			text.contains("não foi lançado", ignoreCase = true)
 	}
 
 	private fun parseChapterIdMapFromJsonArray(array: JSONArray): Map<String, String> {
@@ -1143,7 +1169,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		if (obj == null) return 0f
 		val fromLast = when (val value = obj.opt("lastChapter")) {
 			is Number -> value.toFloat()
-			is String -> value.toFloatOrNull() ?: 0f
+			is String -> Regex("""(\d+(?:\.\d+)?)""").find(value)?.value?.toFloatOrNull() ?: 0f
 			else -> 0f
 		}
 		var fromRecent = 0f
