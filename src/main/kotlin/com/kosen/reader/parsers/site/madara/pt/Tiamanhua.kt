@@ -91,19 +91,25 @@ internal class Tiamanhua(context: MangaLoaderContext) :
 		if (parsed.isNotEmpty()) {
 			return parsed
 		}
-		val slider = doc.select("#manga-slider-2 .slider__item, .slider__item, #loop-content .page-item-detail")
+		val slider = doc.select(
+			"#loop-content .page-listing-item .page-item-detail.manga, " +
+				"#loop-content .page-item-detail, " +
+				"#manga-slider-2 .slider__item, " +
+				".slider__item, " +
+				"div.page-item-detail",
+		)
 		if (slider.isEmpty()) {
 			return emptyList()
 		}
 		return slider.mapNotNull { element ->
-			val anchor = element.selectFirst("a[href*='/manhwa/'], a[href]") ?: return@mapNotNull null
+			val anchor = element.selectFirst("a[href*='/manhwa/'], a[href*='/ler/'], a[href]") ?: return@mapNotNull null
 			val href = anchor.attr("href").toRelativeUrl(domain)
 			if (href.isBlank() || href == "/") {
 				return@mapNotNull null
 			}
 			val title = element.selectFirst("h3 a, h4 a, .post-title a")?.textOrNull()
 				?: anchor.attr("title").takeIf { it.isNotBlank() }
-				?: href.substringAfter("/manhwa/").substringBefore('/').replace('-', ' ')
+				?: href.substringAfter("/manhwa/").substringAfter("/ler/").substringBefore('/').replace('-', ' ')
 			Manga(
 				id = generateUid(href),
 				url = href,
@@ -133,10 +139,8 @@ internal class Tiamanhua(context: MangaLoaderContext) :
 		return buildString {
 			append("https://")
 			append(domain)
-			if (pages > 1) {
-				append("/page/")
-				append(pages)
-			}
+			append("/page/")
+			append(pages)
 			append("/?s=")
 			filter.query?.let { append(it.urlEncoded()) }
 			append("&post_type=wp-manga")
@@ -174,32 +178,68 @@ internal class Tiamanhua(context: MangaLoaderContext) :
 
 	private suspend fun loadDocument(url: String): Document {
 		val httpDoc = runCatching { webClient.httpGet(url).parseHtml() }.getOrNull()
-		if (httpDoc != null && !isChallengePage(httpDoc)) {
+		if (httpDoc != null && !isChallengePage(httpDoc) && hasSiteContent(httpDoc)) {
 			return httpDoc
 		}
-		return captureDocument(url)
+		val captured = runCatching { captureDocument(url) }.getOrNull()
+		if (captured != null && !isChallengePage(captured) && hasSiteContent(captured)) {
+			return captured
+		}
+		context.requestBrowserAction(this, url)
 	}
 
 	private suspend fun captureDocument(url: String): Document {
 		val script = """
-			(() => {
-				const html = document.documentElement ? document.documentElement.outerHTML : '';
-				const blocked = html.indexOf('lsrecaptcha') >= 0 ||
-					html.indexOf('Bot Verification') >= 0 ||
-					html.indexOf('Verifying that you are not a robot') >= 0 ||
-					html.indexOf('cf-challenge') >= 0 ||
-					html.indexOf('Just a moment') >= 0;
-				if (blocked) return null;
-				const ready = document.querySelector('div.page-item-detail, .slider__item, div.summary_content, .post-title, div.reading-content, div.page-break, li.wp-manga-chapter');
-				if (!ready) return null;
-				window.stop();
-				return document.documentElement.outerHTML;
+			window.__evaluateJsDone = undefined;
+			(function(){
+				function finish(value){
+					window.__evaluateJsDone = (typeof value === 'string') ? value : String(value || '');
+				}
+				function html(){
+					return document.documentElement ? document.documentElement.outerHTML : '';
+				}
+				function blocked(){
+					const text = html();
+					return text.indexOf('lsrecaptcha') >= 0 ||
+						text.indexOf('Bot Verification') >= 0 ||
+						text.indexOf('Verifying that you are not a robot') >= 0 ||
+						text.indexOf('cf-challenge') >= 0 ||
+						text.indexOf('Just a moment') >= 0;
+				}
+				function ready(){
+					return document.querySelector(
+						'div.page-item-detail, .page-listing-item, .slider__item, #manga-slider-2, #loop-content, ' +
+						'div.summary_content, .post-title, div.reading-content, div.page-break, li.wp-manga-chapter, ' +
+						'.wp-manga-chapter, .c-tabs-item'
+					);
+				}
+				async function wait(){
+					for (let i = 0; i < 90; i++) {
+						if (!blocked() && ready()) {
+							finish(html());
+							return;
+						}
+						await new Promise(r => setTimeout(r, 500));
+					}
+					finish(ready() && !blocked() ? html() : '');
+				}
+				wait();
 			})();
 		""".trimIndent()
-		val rawHtml = context.evaluateJs(url, script, 30000L)
-			?: throw ParseException("TiaManhwa pediu verificação. Abra a fonte no navegador interno e tente de novo.", url)
-		return Jsoup.parse(unwrapJsString(rawHtml), url)
+		val rawHtml = context.evaluateJs(url, script, 48000L)
+			?: throw ParseException("TiaManhwa pediu verificação.", url)
+		val doc = Jsoup.parse(unwrapJsString(rawHtml), url)
+		if (isChallengePage(doc) || !hasSiteContent(doc)) {
+			throw ParseException("TiaManhwa pediu verificação.", url)
+		}
+		return doc
 	}
+
+	private fun hasSiteContent(doc: Document): Boolean =
+		doc.selectFirst(
+			"div.page-item-detail, .page-listing-item, .slider__item, #manga-slider-2, #loop-content, " +
+				"div.summary_content, .post-title, div.reading-content, div.page-break, li.wp-manga-chapter",
+		) != null
 
 	private fun isChallengePage(doc: Document): Boolean {
 		val title = doc.title()

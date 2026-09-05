@@ -144,13 +144,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val recentChapters = libraryObra?.optJSONArray("recentChapters")
 		val recentList = recentChapters?.let { mapRecentLibraryChapters(slug, it) }.orEmpty()
 		val apiChapters = fetchChaptersBySlug(slug, libraryObra?.getStringOrNull("id"))
+		val jsManga = runCatching { fetchDetailsViaJs(slug, manga) }.getOrNull()
 		val needFullList = recentList.size < lastNumber.toInt().coerceAtLeast(1) &&
-			(apiChapters?.size ?: 0) < lastNumber.toInt().coerceAtLeast(1)
-		val jsManga = if (needFullList) {
-			runCatching { fetchDetailsViaJs(slug, manga) }.getOrNull()
-		} else {
-			null
-		}
+			(apiChapters?.size ?: 0) < lastNumber.toInt().coerceAtLeast(1) &&
+			jsManga?.chapters.isNullOrEmpty()
 		val pageUrl = manga.url.toAbsoluteUrl(domain)
 		val html = if (needFullList && jsManga?.chapters.isNullOrEmpty()) {
 			runCatching { fetchRawHtml(pageUrl) }.getOrNull()?.takeUnless { isFingerprintBlock(it) }
@@ -240,21 +237,23 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val match = CHAPTER_URL_REGEX.matchEntire(chapter.url.substringBefore('?'))
+		val slug = match?.groupValues?.get(1).orEmpty()
+		val number = match?.groupValues?.get(2).orEmpty()
 		val chapterId = chapterApiId(chapter.url)
+		if (slug.isNotEmpty() && number.isNotEmpty()) {
+			tryFetchTaurusPages(slug, number).takeIf { it.isNotEmpty() }?.let { return it }
+		}
+		runCatching { fetchPagesViaJs(slug, number, chapterId) }
+			.getOrNull()
+			?.takeIf { it.isNotEmpty() }
+			?.let { return it }
 		if (!chapterId.isNullOrBlank()) {
 			try {
 				return fetchPagesFromApi("/api/chapters?id=$chapterId")
 			} catch (e: ParseException) {
 				if (isTerminalChapterError(e.shortMessage)) throw e
 			} catch (_: Exception) {
-				// API recusou o HTTP; tenta o mesmo ID pelo WebView.
 			}
-		}
-		if (match != null) {
-			runCatching { fetchPagesViaJs(match.groupValues[1], match.groupValues[2], chapterId) }
-				.getOrNull()
-				?.takeIf { it.isNotEmpty() }
-				?.let { return it }
 		}
 		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
 	}
@@ -727,26 +726,24 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				const urls = [
 					'/api/library?slug=' + encodeURIComponent(slug),
 					'/api/library/chapters?slug=' + encodeURIComponent(slug),
+					'/api/library-proxy?search=' + encodeURIComponent(slug) + '&limit=20',
 				];
 				for (const url of urls) {
 					const data = await fetchJson(url);
 					if (!data || data.error || data._xData) continue;
 					const arr = data.chapters || data.allChapters || data.capitulos || data.data;
-					const entries = toEntries(arr);
+					let entries = toEntries(arr);
+					if (!entries.length && data.obras) entries = toEntries((data.obras.find && data.obras.find((o) => o && o.slug === slug) || {}).recentChapters || []);
+					if (!entries.length && Array.isArray(data.garimpo)) {
+						const obra = data.garimpo.concat(data.prateleira || [], data.acervo || []).find((o) => o && o.slug === slug);
+						if (obra) entries = toEntries(obra.chapters || obra.recentChapters || []);
+					}
 					if (entries.length) return { title: data.title || '', entries: entries, links: [], total: entries.length };
 				}
 				return null;
 			};
-			const collect = () => {
-				const links = [];
-				const seen = new Set();
-				for (const a of document.querySelectorAll('a[href*="/ler/"]')) {
-					const href = (a.getAttribute('href') || '').split('#')[0];
-					if (!href || seen.has(href)) continue;
-					seen.add(href);
-					links.push(href);
-				}
-				const html = document.documentElement ? document.documentElement.innerHTML : '';
+			const parseHtml = (html) => {
+				if (!html) return { title: '', description: '', cover: '', links: [], entries: [], total: 0 };
 				const entries = [];
 				const seenId = new Set();
 				const re = /"number"\s*:\s*"?(\d+(?:\.\d+)?)"?[\s\S]{0,280}?"id"\s*:\s*"([0-9a-f-]{8,})"/gi;
@@ -760,37 +757,24 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (allMatch) {
 					try { toEntries(JSON.parse(allMatch[1])).forEach((e) => { if (!seenId.has(e.id)) { seenId.add(e.id); entries.push(e); } }); } catch (e) {}
 				}
+				const links = [];
+				const needle = '/ler/' + slug + '/';
+				const linkRe = /href=["']([^"']+)/gi;
+				let lm;
+				while ((lm = linkRe.exec(html))) {
+					if (lm[1].indexOf(needle) >= 0) links.push(lm[1]);
+				}
 				const totalMatch = html.match(/chapterTotal["']?\s*[:=]\s*(\d+)/) || html.match(/"totalChapters"\s*:\s*(\d+)/);
-				const total = totalMatch ? parseInt(totalMatch[1], 10) : entries.length;
-				return {
-					title: document.querySelector('h1')?.textContent?.trim() || '',
-					description: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
-					cover: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
-					links: links,
-					entries: entries,
-					total: total,
-				};
+				return { title: '', description: '', cover: '', links: links, entries: entries, total: totalMatch ? parseInt(totalMatch[1], 10) : entries.length };
 			};
-			await waitForClient(3500);
+			await waitForClient(4000);
 			const api = await fromApi();
 			if (api && api.entries.length > 2) { finish(api); return; }
-			let best = collect();
-			for (let attempts = 0; attempts < 12; attempts++) {
-				const value = collect();
-				if (value.links.length > best.links.length) best.links = value.links;
-				if (value.entries.length > best.entries.length) best.entries = value.entries;
-				if (value.total > best.total) best.total = value.total;
-				if (value.title) best.title = value.title;
-				if (best.entries.length > 5 || best.links.length > 5) {
-					if (attempts >= 2) { finish(best); return; }
-				}
-				window.scrollTo(0, document.body.scrollHeight);
-				await new Promise(r => setTimeout(r, 220));
-			}
-			if (api && api.entries.length > best.entries.length) best.entries = api.entries;
-			finish(best);
+			const parsed = parseHtml(await fetchText('/obra/' + slug));
+			if (api && api.entries.length > parsed.entries.length) { finish(api); return; }
+			finish(parsed);
 		""".trimIndent()
-		val raw = evalYomuJs("https://$domain/obra/$slug", script, timeout = 20000L) ?: return null
+		val raw = evalYomuJs("https://$domain/", script, timeout = 22000L) ?: return null
 		val json = parseJsValue(raw) as? JSONObject ?: return null
 		if (isAuthWall(json)) return null
 		val found = LinkedHashMap<String, MangaChapter>()
@@ -847,38 +831,47 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	private suspend fun fetchPagesViaJs(slug: String, chapterNumber: String, knownId: String? = null): List<MangaPage> {
 		val knownIdJson = JSONObject.quote(knownId.orEmpty())
+		val slugJson = JSONObject.quote(slug)
+		val numberJson = JSONObject.quote(chapterNumber)
 		val script = """
 			const knownId = $knownIdJson;
+			const slug = $slugJson;
+			const chapterNumber = $numberJson;
 			if (onLoginWall()) { finish({error:'auth'}); return; }
 			const tryId = async (id) => {
 				if (!id) return null;
 				return pagesFromPayload(await fetchChapter(id));
 			};
-			await waitForClient(2500);
-			if (knownId) {
-				const images = await tryId(knownId);
-				if (images) { finish(images); return; }
-			}
-			for (let attempts = 0; attempts < 20; attempts++) {
-				const params = new URLSearchParams(location.search || '');
-				let id = params.get('id');
-				if (!id && location.pathname && location.pathname.indexOf('/ler/') >= 0) {
-					const html = document.documentElement ? document.documentElement.innerHTML : '';
-					const m = html.match(/"chapterId"\s*:\s*"([^"]+)"/) || html.match(/chapterId["']?\s*[:=]\s*["']([^"']+)/);
-					if (m) id = m[1];
+			const hooked = () => (window.__yomuPages && window.__yomuPages.length) ? window.__yomuPages : null;
+			const resolveId = async () => {
+				if (knownId) return knownId;
+				const target = Number(chapterNumber);
+				if (!slug || !Number.isFinite(target)) return '';
+				const urls = [
+					'/api/library?slug=' + encodeURIComponent(slug),
+					'/api/library/chapters?slug=' + encodeURIComponent(slug),
+					'/api/library-proxy?search=' + encodeURIComponent(slug) + '&limit=20',
+				];
+				for (const url of urls) {
+					const data = await fetchJson(url);
+					if (!data || data.error || data._xData) continue;
+					const arr = data.chapters || data.allChapters || data.capitulos || data.data || [];
+					if (!Array.isArray(arr)) continue;
+					for (const ch of arr) {
+						if (!ch) continue;
+						const n = Number(ch.number ?? ch.num ?? ch.chapterNumber);
+						const id = ch.id || ch.chapterId;
+						if (n === target && id) return String(id);
+					}
 				}
-				const images = await tryId(id);
-				if (images) { finish(images); return; }
-				await new Promise(r => setTimeout(r, 250));
-			}
+				return '';
+			};
+			await waitForClient(4000);
+			const images = await tryId(await resolveId()) || hooked();
+			if (images) { finish(images); return; }
 			finish([]);
 		""".trimIndent()
-		val pageUrl = if (knownId.isNullOrBlank()) {
-			"https://$domain/ler/$slug/$chapterNumber"
-		} else {
-			"https://$domain/obra/$slug"
-		}
-		val raw = evalYomuJs(pageUrl, script, timeout = 20000L) ?: return emptyList()
+		val raw = evalYomuJs("https://$domain/", script, timeout = 22000L) ?: return emptyList()
 		val value = parseJsValue(raw) ?: return emptyList()
 		if (isAuthWall(value)) return emptyList()
 		val array = when (value) {
