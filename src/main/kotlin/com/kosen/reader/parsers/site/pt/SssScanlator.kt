@@ -26,7 +26,7 @@ import com.kosen.reader.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("SSSSCANLATOR", "Yomu", "pt")
+@MangaSourceParser("SSSSCANLATOR", "Yomu Comics", "pt")
 internal class SssScanlator(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.SSSSCANLATOR, pageSize = 30),
 	MangaParserAuthProvider {
@@ -44,6 +44,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
 		keys.add(authSessionKey)
+		keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
 	}
 
 	override val userAgentKey: ConfigKey.UserAgent = ConfigKey.UserAgent(
@@ -123,6 +124,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		runCatching { fetchListViaJs(filter, page) }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		runCatching { fetchLibraryJson(page, order, filter) }.getOrNull()
 			?.optLibraryArray()
 			?.let(::mapLibraryArray)
@@ -130,7 +132,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			?.let { return it }
 		fetchTaurusList(page, order, filter)?.takeIf { it.isNotEmpty() }?.let { return it }
 		if (page == 1) {
-			runCatching { fetchListViaJs(filter) }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 			throw ParseException("Yomu não devolveu o catálogo. Puxe para atualizar.", "/")
 		}
 		return emptyList()
@@ -475,14 +476,36 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("try {\n")
 		append("const r = await fetch(url, {credentials:'include', cache:'no-store', headers:{'Accept':'application/json','x-yomu-client':'true'}});\n")
 		append("if (!r.ok) return null;\n")
-		append("return await r.json();\n")
+		append("const text = await r.text();\n")
+		append("if (!text || text.indexOf('Invalid browser fingerprint') >= 0) return null;\n")
+		append("try { return JSON.parse(text); } catch (e) { return null; }\n")
 		append("} catch (e) { return null; }\n")
+		append("}\n")
+		append("async function fetchText(url){\n")
+		append("try {\n")
+		append("const r = await fetch(url, {credentials:'include', cache:'no-store', headers:{'Accept':'text/html','x-yomu-client':'true'}});\n")
+		append("if (!r.ok) return '';\n")
+		append("const text = await r.text();\n")
+		append("if (!text || text.indexOf('Invalid browser fingerprint') >= 0) return '';\n")
+		append("return text;\n")
+		append("} catch (e) { return ''; }\n")
+		append("}\n")
+		append("async function waitForClient(ms){\n")
+		append("const start = Date.now();\n")
+		append("while (Date.now() - start < ms) {\n")
+		append("const probe = await fetchJson('/api/genres');\n")
+		append("if (probe) return true;\n")
+		append("await new Promise(r => setTimeout(r, 350));\n")
+		append("}\n")
+		append("return false;\n")
 		append("}\n")
 		append("async function fetchChapter(id){\n")
 		append("try {\n")
 		append("const r = await fetch('/api/chapters?id=' + encodeURIComponent(id), {credentials:'include', cache:'no-store', headers:{'Accept':'application/json','x-yomu-client':'true','x-ym-req': ymReq(id)}});\n")
 		append("if (!r.ok) return null;\n")
-		append("return await r.json();\n")
+		append("const text = await r.text();\n")
+		append("if (!text || text.indexOf('Invalid browser fingerprint') >= 0) return null;\n")
+		append("try { return JSON.parse(text); } catch (e) { return null; }\n")
 		append("} catch (e) { return null; }\n")
 		append("}\n")
 		append("function pagesFromPayload(data){\n")
@@ -584,10 +607,11 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			)
 		}
 
-	private suspend fun fetchListViaJs(filter: MangaListFilter): List<Manga>? {
+	private suspend fun fetchListViaJs(filter: MangaListFilter, page: Int): List<Manga>? {
 		val query = JSONObject.quote(filter.query?.trim().orEmpty())
 		val script = """
 			const query = $query;
+			const page = $page;
 			const isNumericTitle = (t) => /^\d+([.,]\d+)?$/.test((t || '').trim());
 			const pickTitle = (a, img, slug) => {
 				const heading = a.querySelector('h2, h3, h4, [class*="title"], [class*="name"]');
@@ -615,15 +639,42 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				return items;
 			};
-			const libUrl = '/api/library-proxy?page=1&limit=30&sort=updated' + (query ? '&search=' + encodeURIComponent(query) : '');
-			const libFirst = await fetchJson(libUrl);
-			if (libFirst && !libFirst._xData && !libFirst.error) { finish(libFirst); return; }
-			for (let attempts = 0; attempts < 20; attempts++) {
-				if (onLoginWall()) { finish({error:'auth'}); return; }
-				const items = collect();
-				if (items.length > 0) { finish(items); return; }
-				window.scrollTo(0, document.body.scrollHeight);
-				await new Promise(r => setTimeout(r, 200));
+			const qs = 'page=' + page + '&limit=30&sort=updated' + (query ? '&search=' + encodeURIComponent(query) : '');
+			const libraryLooksGood = (data) => data && !data._xData && !data.error && (
+				data.garimpo || data.prateleira || data.acervo || data.obras || data.data || data.catalogo || data.series || Array.isArray(data)
+			);
+			await waitForClient(4000);
+			for (const url of ['/api/library-proxy?' + qs, '/api/library?' + qs]) {
+				const libFirst = await fetchJson(url);
+				if (libraryLooksGood(libFirst)) { finish(libFirst); return; }
+			}
+			const parseHtmlItems = (html) => {
+				if (!html) return [];
+				const items = [];
+				const seen = new Set();
+				const re = /href=["']([^"']*\/obra\/[^"'?#]+)/gi;
+				let m;
+				while ((m = re.exec(html))) {
+					const match = m[1].match(/\/obra\/([^/#?]+)/);
+					if (!match || match[1] === 'bloqueado' || /^\d+$/.test(match[1]) || seen.has(match[1])) continue;
+					seen.add(match[1]);
+					items.push({ slug: match[1], title: match[1].replace(/-/g, ' '), cover: '' });
+				}
+				return items;
+			};
+			if (page === 1) {
+				for (const path of ['/biblioteca', '/home', '/']) {
+					const html = await fetchText(path);
+					const items = parseHtmlItems(html);
+					if (items.length > 0) { finish(items); return; }
+				}
+				for (let attempts = 0; attempts < 16; attempts++) {
+					if (onLoginWall()) { finish({error:'auth'}); return; }
+					const items = collect();
+					if (items.length > 0) { finish(items); return; }
+					window.scrollTo(0, document.body.scrollHeight);
+					await new Promise(r => setTimeout(r, 250));
+				}
 			}
 			finish([]);
 		""".trimIndent()
@@ -632,7 +683,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		} else {
 			"https://$domain/"
 		}
-		val raw = evalYomuJs(pageUrl, script, timeout = 14000L) ?: return null
+		val raw = evalYomuJs(pageUrl, script, timeout = 22000L) ?: return null
 		val value = parseJsValue(raw)
 		if (isAuthWall(value)) return null
 		val found = ArrayList<Manga>()
@@ -720,6 +771,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					total: total,
 				};
 			};
+			await waitForClient(3500);
 			const api = await fromApi();
 			if (api && api.entries.length > 2) { finish(api); return; }
 			let best = collect();
@@ -738,7 +790,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			if (api && api.entries.length > best.entries.length) best.entries = api.entries;
 			finish(best);
 		""".trimIndent()
-		val raw = evalYomuJs("https://$domain/obra/$slug", script, timeout = 14000L) ?: return null
+		val raw = evalYomuJs("https://$domain/obra/$slug", script, timeout = 20000L) ?: return null
 		val json = parseJsValue(raw) as? JSONObject ?: return null
 		if (isAuthWall(json)) return null
 		val found = LinkedHashMap<String, MangaChapter>()
@@ -802,6 +854,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (!id) return null;
 				return pagesFromPayload(await fetchChapter(id));
 			};
+			await waitForClient(2500);
 			if (knownId) {
 				const images = await tryId(knownId);
 				if (images) { finish(images); return; }
@@ -825,7 +878,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		} else {
 			"https://$domain/obra/$slug"
 		}
-		val raw = evalYomuJs(pageUrl, script, timeout = 16000L) ?: return emptyList()
+		val raw = evalYomuJs(pageUrl, script, timeout = 20000L) ?: return emptyList()
 		val value = parseJsValue(raw) ?: return emptyList()
 		if (isAuthWall(value)) return emptyList()
 		val array = when (value) {
