@@ -535,7 +535,14 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("if (typeof x === 'string') return x;\n")
 		append("if (!x) return '';\n")
 		append("return x.url || x.src || x.image || x.path || '';\n")
-		append("}).filter(Boolean);\n")
+		append("}).filter(function(u){\n")
+		append("if (!u) return false;\n")
+		append("const s = String(u).toLowerCase();\n")
+		append("if (s.indexOf('aviso-scraper') >= 0 || s.indexOf('vampeta') >= 0 || s.indexOf('mascote') >= 0) return false;\n")
+		append("if (s.indexOf('/capa/') >= 0 || s.indexOf('/cover') >= 0 || s.indexOf('/poster') >= 0 || s.indexOf('/banner') >= 0) return false;\n")
+		append("if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0) return false;\n")
+		append("return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;\n")
+		append("});\n")
 		append("return urls.length ? urls : null;\n")
 		append("}\n")
 		append("function installPageHook(){\n")
@@ -959,6 +966,18 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			val chapterScript = """
 				if (onLoginWall()) { finish({error:'auth'}); return; }
 				installPageHook();
+				const looksVip = () => {
+					const t = (document.body && document.body.innerText) || '';
+					return /exclusivo para\s*vip|cap[ií]tulo.*vip|assine.*vip|lockedType|isLocked/i.test(t);
+				};
+				const isRealPage = (u) => {
+					if (!u) return false;
+					const s = String(u).toLowerCase();
+					if (s.indexOf('aviso-scraper') >= 0 || s.indexOf('vampeta') >= 0 || s.indexOf('mascote') >= 0) return false;
+					if (s.indexOf('/capa/') >= 0 || s.indexOf('/cover') >= 0 || s.indexOf('/poster') >= 0 || s.indexOf('/banner') >= 0) return false;
+					if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
+					return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
+				};
 				await waitForClient(7000);
 				const knownId = $knownIdJson;
 				if (knownId) {
@@ -971,10 +990,17 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					if (pages) { finish(pages); return; }
 				}
 				for (let i = 0; i < 28; i++) {
-					if (window.__yomuPages && window.__yomuPages.length) { finish(window.__yomuPages); return; }
+					if (looksVip()) {
+						finish({error: 'Este capítulo é exclusivo para VIPs.', isLocked: true, lockedType: 'VIP'});
+						return;
+					}
+					if (window.__yomuPages && window.__yomuPages.length) {
+						const real = window.__yomuPages.filter(isRealPage);
+						if (real.length > 1) { finish(real); return; }
+					}
 					const imgs = Array.from(document.querySelectorAll('img'))
 						.map((img) => img.currentSrc || img.src || '')
-						.filter((u) => u && (u.indexOf('/chapters/') >= 0 || u.indexOf('secure-image') >= 0 || u.indexOf('proxy-image') >= 0 || u.indexOf('cdn.') >= 0));
+						.filter(isRealPage);
 					if (imgs.length > 1) { finish(imgs); return; }
 					await new Promise((r) => setTimeout(r, 250));
 				}
@@ -1466,27 +1492,31 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	private fun isChapterPageUrl(url: String): Boolean {
 		if (isTrapAsset(url)) return false
 		val lower = url.lowercase(Locale.ROOT)
-		if (lower.contains("mascote") || lower.contains("/images/")) return false
+		if (lower.contains("mascote") || lower.contains("/images/") || lower.contains("perfil")) return false
 		if (lower.contains("/capa/") || lower.contains("/cover") ||
-			lower.contains("/poster") || lower.contains("/banner")
+			lower.contains("/poster") || lower.contains("/banner") ||
+			lower.contains("/thumb") || lower.contains("placeholder")
 		) {
 			return false
 		}
+		// Só páginas reais do leitor — capas/CDN genérico viravam "fotos genéricas".
 		return lower.contains("/chapters/") ||
 			lower.contains("secure-image") ||
-			lower.contains("proxy-image") ||
-			lower.contains("chapter-images") ||
-			((lower.contains("cdn.yomu") || lower.contains("cdn.monstercomics") || lower.contains("b2.yomu")) &&
-				(lower.endsWith(".webp") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
-					lower.endsWith(".png") || lower.endsWith(".avif") || lower.contains("/capitulo")))
+			lower.contains("proxy-image")
 	}
 
 	private fun isTrapDescription(text: String): Boolean =
 		text.contains("bloqueado contra scrapers", ignoreCase = true)
 
-	private fun isTrapAsset(url: String): Boolean =
-		url.contains("aviso-scraper", ignoreCase = true) ||
-			url.contains("vampeta", ignoreCase = true)
+	private fun isTrapAsset(url: String): Boolean {
+		val lower = url.lowercase(Locale.ROOT)
+		return lower.contains("aviso-scraper") ||
+			lower.contains("vampeta") ||
+			lower.contains("mascote") ||
+			lower.contains("yomu.png") ||
+			lower.contains("/images/perfil") ||
+			lower.contains("fake-cap")
+	}
 
 	private fun isTrapChapterId(id: String): Boolean =
 		id.startsWith("fake", ignoreCase = true)
