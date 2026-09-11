@@ -240,21 +240,15 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val slug = match?.groupValues?.get(1).orEmpty()
 		val number = match?.groupValues?.get(2).orEmpty()
 		val chapterId = chapterApiId(chapter.url)
-		// /api/chapters com x-ym-req responde sem login para capítulos free (VIP devolve erro claro).
+		// /api/chapters costuma marcar capítulos como VIP quando o fingerprint do bot
+		// é rejeitado (armadilha anti-scraper), não porque exista bloqueio real — por
+		// isso nunca tratamos isso como definitivo e sempre tentamos os outros métodos.
 		if (!chapterId.isNullOrBlank()) {
-			try {
-				return fetchPagesFromApi("/api/chapters?id=$chapterId")
-			} catch (e: ParseException) {
-				if (isTerminalChapterError(e.shortMessage)) throw e
-			} catch (_: Exception) {
-			}
+			runCatching { fetchPagesFromApi("/api/chapters?id=$chapterId") }
+				.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		}
-		try {
-			fetchPagesViaJs(slug, number, chapterId).takeIf { it.isNotEmpty() }?.let { return it }
-		} catch (e: ParseException) {
-			if (isTerminalChapterError(e.shortMessage)) throw e
-		} catch (_: Exception) {
-		}
+		runCatching { fetchPagesViaJs(slug, number, chapterId) }
+			.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		if (slug.isNotEmpty() && number.isNotEmpty()) {
 			tryFetchTaurusPages(slug, number).takeIf { it.isNotEmpty() }?.let { return it }
 		}
@@ -1142,14 +1136,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			message.isNotBlank() -> message
 			else -> "Não foi possível carregar as páginas do capítulo"
 		}
-	}
-
-	private fun isTerminalChapterError(message: String?): Boolean {
-		val text = message.orEmpty()
-		return text.contains("VIP", ignoreCase = true) ||
-			text.contains("bloqueado", ignoreCase = true) ||
-			text.contains("exclusivo", ignoreCase = true) ||
-			text.contains("não foi lançado", ignoreCase = true)
 	}
 
 	private fun parseChapterIdMapFromJsonArray(array: JSONArray): Map<String, String> {
