@@ -495,16 +495,18 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("}\n")
 		append("async function waitForClient(ms){\n")
 		append("const start = Date.now();\n")
-		append("const proxy = await fetchJson('/api/library-proxy?page=1&limit=1&sort=updated');\n")
-		append("if (proxy && (proxy.garimpo || proxy.catalogo || proxy.prateleira)) return true;\n")
-		append("const probe = await fetchJson('/api/genres');\n")
-		append("if (probe) return true;\n")
+		append("let softOk = false;\n")
+		// library-proxy responde sem fingerprint; /api/chapters precisa do client real.
 		append("while (Date.now() - start < ms) {\n")
 		append("const lib = await fetchJson('/api/library?page=1&limit=1&sort=updated');\n")
 		append("if (lib && !lib.error && !lib._xData) return true;\n")
-		append("await new Promise(r => setTimeout(r, 250));\n")
+		append("const proxy = await fetchJson('/api/library-proxy?page=1&limit=1&sort=updated');\n")
+		append("if (proxy && (proxy.garimpo || proxy.catalogo || proxy.prateleira)) softOk = true;\n")
+		append("const probe = await fetchJson('/api/genres');\n")
+		append("if (probe) softOk = true;\n")
+		append("await new Promise(r => setTimeout(r, 300));\n")
 		append("}\n")
-		append("return false;\n")
+		append("return softOk;\n")
 		append("}\n")
 		append("async function fetchChapter(id){\n")
 		append("try {\n")
@@ -896,44 +898,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val slugJson = JSONObject.quote(slug)
 		val numberJson = JSONObject.quote(chapterNumber)
 
-		// Com ID conhecido: um único WebView na página do capítulo (bem mais rápido).
-		if (!knownId.isNullOrBlank() && slug.isNotEmpty() && chapterNumber.isNotEmpty()) {
-			val chapterPath = "https://$domain/ler/$slug/$chapterNumber?id=$knownId"
-			val chapterScript = """
-				if (onLoginWall()) { finish({error:'auth'}); return; }
-				installPageHook();
-				const isRealPage = (u) => {
-					if (!u) return false;
-					const s = String(u).toLowerCase();
-					if (s.indexOf('aviso-scraper') >= 0 || s.indexOf('vampeta') >= 0 || s.indexOf('mascote') >= 0) return false;
-					if (s.indexOf('/capa/') >= 0 || s.indexOf('/cover') >= 0 || s.indexOf('/poster') >= 0 || s.indexOf('/banner') >= 0) return false;
-					if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
-					return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
-				};
-				await waitForClient(1500);
-				const knownId = $knownIdJson;
-				const data = await fetchChapter(knownId);
-				const pages = pagesFromPayload(data);
-				if (pages) { finish(pages); return; }
-				for (let i = 0; i < 12; i++) {
-					if (window.__yomuPages && window.__yomuPages.length) {
-						const real = window.__yomuPages.filter(isRealPage);
-						if (real.length > 1) { finish(real); return; }
-					}
-					const imgs = Array.from(document.querySelectorAll('img'))
-						.map((img) => img.currentSrc || img.src || '')
-						.filter(isRealPage);
-					if (imgs.length > 1) { finish(imgs); return; }
-					await new Promise((r) => setTimeout(r, 200));
-				}
-				finish([]);
-			""".trimIndent()
-			parsePagesJsResult(evalYomuJs(chapterPath, chapterScript, timeout = 12000L), chapterPath)
-				?.takeIf { it.isNotEmpty() }
-				?.let { return it }
-		}
-
-		val script = """
+		// Home primeiro: carrega o fingerprint do client ( /ler/... sozinho costuma 302/falhar ).
+		val landingScript = """
 			const knownId = $knownIdJson;
 			const slug = $slugJson;
 			const chapterNumber = $numberJson;
@@ -941,7 +907,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			installPageHook();
 			const tryId = async (id) => {
 				if (!id) return null;
-				return pagesFromPayload(await fetchChapter(id));
+				const data = await fetchChapter(id);
+				return pagesFromPayload(data);
 			};
 			const resolveId = async () => {
 				if (knownId) return knownId;
@@ -949,8 +916,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (!slug || !Number.isFinite(target)) return '';
 				const titleHint = slug.replace(/-/g, ' ');
 				const urls = [
-					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 					'/api/library?slug=' + encodeURIComponent(slug),
+					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 				];
 				for (const url of urls) {
 					const data = await fetchJson(url);
@@ -971,14 +938,65 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				return '';
 			};
-			await waitForClient(1500);
-			const images = await tryId(await resolveId());
-			if (images) { finish(images); return; }
+			await waitForClient(5500);
+			let id = await resolveId();
+			for (let attempt = 0; attempt < 4; attempt++) {
+				const images = await tryId(id);
+				if (images) { finish(images); return; }
+				if (window.__yomuPages && window.__yomuPages.length) { finish(window.__yomuPages); return; }
+				await new Promise((r) => setTimeout(r, 400));
+				id = id || await resolveId();
+			}
+			finish([]);
+		""".trimIndent()
+		parsePagesJsResult(
+			evalYomuJs("https://$domain/", landingScript, timeout = 20000L),
+			"/ler/$slug/$chapterNumber",
+		)?.takeIf { it.isNotEmpty() }?.let { return it }
+
+		if (slug.isEmpty() || chapterNumber.isEmpty()) return emptyList()
+
+		val chapterPath = if (!knownId.isNullOrBlank()) {
+			"https://$domain/ler/$slug/$chapterNumber?id=$knownId"
+		} else {
+			"https://$domain/ler/$slug/$chapterNumber"
+		}
+		val chapterScript = """
+			if (onLoginWall()) { finish({error:'auth'}); return; }
+			installPageHook();
+			const isRealPage = (u) => {
+				if (!u) return false;
+				const s = String(u).toLowerCase();
+				if (s.indexOf('aviso-scraper') >= 0 || s.indexOf('vampeta') >= 0 || s.indexOf('mascote') >= 0) return false;
+				if (s.indexOf('/capa/') >= 0 || s.indexOf('/cover') >= 0 || s.indexOf('/poster') >= 0 || s.indexOf('/banner') >= 0) return false;
+				if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
+				return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
+			};
+			await waitForClient(5500);
+			const knownId = $knownIdJson;
+			if (knownId) {
+				for (let attempt = 0; attempt < 4; attempt++) {
+					const pages = pagesFromPayload(await fetchChapter(knownId));
+					if (pages) { finish(pages); return; }
+					await new Promise((r) => setTimeout(r, 400));
+				}
+			}
+			for (let i = 0; i < 20; i++) {
+				if (window.__yomuPages && window.__yomuPages.length) {
+					const real = window.__yomuPages.filter(isRealPage);
+					if (real.length > 1) { finish(real); return; }
+				}
+				const imgs = Array.from(document.querySelectorAll('img'))
+					.map((img) => img.currentSrc || img.src || '')
+					.filter(isRealPage);
+				if (imgs.length > 1) { finish(imgs); return; }
+				await new Promise((r) => setTimeout(r, 250));
+			}
 			finish([]);
 		""".trimIndent()
 		return parsePagesJsResult(
-			evalYomuJs("https://$domain/", script, timeout = 12000L),
-			"/ler/$slug/$chapterNumber",
+			evalYomuJs(chapterPath, chapterScript, timeout = 20000L),
+			chapterPath,
 		).orEmpty()
 	}
 
