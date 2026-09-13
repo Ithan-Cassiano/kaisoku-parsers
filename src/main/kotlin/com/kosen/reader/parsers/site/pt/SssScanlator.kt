@@ -899,8 +899,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val slugJson = JSONObject.quote(slug)
 		val numberJson = JSONObject.quote(chapterNumber)
 
-		// Um WebView na home: faz poll direto de /api/chapters (o fingerprint libera no meio).
-		// Evita waitForClient fixo de 5s+ e o segundo WebView na maioria dos casos.
+		// Restaurado do fluxo estável (2.0.60): espera fingerprint real, depois /api/chapters.
 		val landingScript = """
 			const knownId = $knownIdJson;
 			const slug = $slugJson;
@@ -909,7 +908,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			installPageHook();
 			const tryId = async (id) => {
 				if (!id) return null;
-				return pagesFromPayload(await fetchChapter(id));
+				const data = await fetchChapter(id);
+				return pagesFromPayload(data);
 			};
 			const resolveId = async () => {
 				if (knownId) return knownId;
@@ -917,8 +917,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (!slug || !Number.isFinite(target)) return '';
 				const titleHint = slug.replace(/-/g, ' ');
 				const urls = [
-					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 					'/api/library?slug=' + encodeURIComponent(slug),
+					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 				];
 				for (const url of urls) {
 					const data = await fetchJson(url);
@@ -939,28 +939,29 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				return '';
 			};
-			let id = knownId || await resolveId();
-			const deadline = Date.now() + 9000;
-			while (Date.now() < deadline) {
-				if (!id) id = await resolveId();
+			await waitForClient(5500);
+			let id = await resolveId();
+			for (let attempt = 0; attempt < 4; attempt++) {
 				const images = await tryId(id);
 				if (images) { finish(images); return; }
-				if (window.__yomuPages && window.__yomuPages.length) {
-					finish(window.__yomuPages); return;
-				}
-				await new Promise((r) => setTimeout(r, 220));
+				if (window.__yomuPages && window.__yomuPages.length) { finish(window.__yomuPages); return; }
+				await new Promise((r) => setTimeout(r, 400));
+				id = id || await resolveId();
 			}
 			finish([]);
 		""".trimIndent()
 		parsePagesJsResult(
-			evalYomuJs("https://$domain/", landingScript, timeout = 14000L),
+			evalYomuJs("https://$domain/", landingScript, timeout = 20000L),
 			"/ler/$slug/$chapterNumber",
 		)?.takeIf { it.isNotEmpty() }?.let { return it }
 
-		if (slug.isEmpty() || chapterNumber.isEmpty() || knownId.isNullOrBlank()) return emptyList()
+		if (slug.isEmpty() || chapterNumber.isEmpty()) return emptyList()
 
-		// Fallback curto só com ID: página do leitor (DOM/hook), sem waitForClient longo.
-		val chapterPath = "https://$domain/ler/$slug/$chapterNumber?id=$knownId"
+		val chapterPath = if (!knownId.isNullOrBlank()) {
+			"https://$domain/ler/$slug/$chapterNumber?id=$knownId"
+		} else {
+			"https://$domain/ler/$slug/$chapterNumber"
+		}
 		val chapterScript = """
 			if (onLoginWall()) { finish({error:'auth'}); return; }
 			installPageHook();
@@ -972,11 +973,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
 				return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
 			};
+			await waitForClient(5500);
 			const knownId = $knownIdJson;
-			const deadline = Date.now() + 7000;
-			while (Date.now() < deadline) {
-				const pages = pagesFromPayload(await fetchChapter(knownId));
-				if (pages) { finish(pages); return; }
+			if (knownId) {
+				for (let attempt = 0; attempt < 4; attempt++) {
+					const pages = pagesFromPayload(await fetchChapter(knownId));
+					if (pages) { finish(pages); return; }
+					await new Promise((r) => setTimeout(r, 400));
+				}
+			}
+			for (let i = 0; i < 20; i++) {
 				if (window.__yomuPages && window.__yomuPages.length) {
 					const real = window.__yomuPages.filter(isRealPage);
 					if (real.length > 1) { finish(real); return; }
@@ -985,12 +991,12 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					.map((img) => img.currentSrc || img.src || '')
 					.filter(isRealPage);
 				if (imgs.length > 1) { finish(imgs); return; }
-				await new Promise((r) => setTimeout(r, 220));
+				await new Promise((r) => setTimeout(r, 250));
 			}
 			finish([]);
 		""".trimIndent()
 		return parsePagesJsResult(
-			evalYomuJs(chapterPath, chapterScript, timeout = 12000L),
+			evalYomuJs(chapterPath, chapterScript, timeout = 20000L),
 			chapterPath,
 		).orEmpty()
 	}
