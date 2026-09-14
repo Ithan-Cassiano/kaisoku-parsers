@@ -40,6 +40,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	private val authSessionKey = ConfigKey.AuthSession(defaultValue = false)
 
+	@Volatile
+	private var chapterIdCacheSlug: String? = null
+	private var chapterIdCache: Map<String, String> = emptyMap()
+
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
@@ -155,6 +159,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		recentChapters?.let { recent ->
 			idMap.putAll(parseChapterIdMapFromJsonArray(recent))
 		}
+		rememberChapterIds(slug, idMap)
 
 		// Monta a lista sem WebView primeiro — evita falhar/abrir lento em obras ok no proxy.
 		var chapters = mergeChapterList(
@@ -260,10 +265,11 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val match = CHAPTER_URL_REGEX.matchEntire(chapter.url.substringBefore('?'))
 		val slug = match?.groupValues?.get(1).orEmpty()
 		val number = match?.groupValues?.get(2).orEmpty()
-		val chapterId = chapterApiId(chapter.url)
-		// /api/chapters costuma marcar capítulos como VIP quando o fingerprint do bot
-		// é rejeitado (armadilha anti-scraper), não porque exista bloqueio real — por
-		// isso nunca tratamos isso como definitivo e sempre tentamos os outros métodos.
+		var chapterId = chapterApiId(chapter.url)
+		// Caps sintetizados na lista rápida não têm ?id= — resolve/cacheia uma vez por obra.
+		if (chapterId.isNullOrBlank() && slug.isNotEmpty() && number.isNotEmpty()) {
+			chapterId = resolveChapterId(slug, number)
+		}
 		if (!chapterId.isNullOrBlank()) {
 			runCatching { fetchPagesFromApi("/api/chapters?id=$chapterId") }
 				.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
@@ -271,7 +277,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		runCatching { fetchPagesViaJs(slug, number, chapterId) }
 			.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		if (slug.isNotEmpty() && number.isNotEmpty()) {
-			// Taurus costuma responder 502 rápido; mantém como último recurso leve.
 			tryFetchTaurusPages(slug, number).takeIf { it.isNotEmpty() }?.let { return it }
 		}
 		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
@@ -283,8 +288,9 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		} else {
 			super.getPageUrl(page)
 		}
-		if (url.contains("/api/chapter/secure-image")) {
-			return "https://$domain/api/proxy-image?q=${url.urlEncoded()}"
+		// secure-image direto (com x-ym-media no interceptor) — evita hop extra do proxy-image.
+		if (url.startsWith("/")) {
+			return "https://$domain$url"
 		}
 		return url
 	}
@@ -311,8 +317,12 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				changed = true
 			}
 		}
-		if (path.contains("/api/proxy-image") && request.header("x-ym-media") == null) {
-			val mediaUrl = url.queryParameter("q").orEmpty()
+		if (request.header("x-ym-media") == null) {
+			val mediaUrl = when {
+				path.contains("/api/proxy-image") -> url.queryParameter("q").orEmpty()
+				path.contains("/api/chapter/secure-image") -> url.toString()
+				else -> ""
+			}
 			if (mediaUrl.isNotEmpty()) {
 				builder.header("x-ym-media", buildYmMediaToken(mediaUrl))
 				changed = true
@@ -523,6 +533,17 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("await new Promise(r => setTimeout(r, 300));\n")
 		append("}\n")
 		append("return softOk;\n")
+		append("}\n")
+		append("async function waitForChapterPages(id, ms){\n")
+		append("if (!id) return null;\n")
+		append("const start = Date.now();\n")
+		append("while (Date.now() - start < ms) {\n")
+		append("const pages = pagesFromPayload(await fetchChapter(id));\n")
+		append("if (pages) return pages;\n")
+		append("if (window.__yomuPages && window.__yomuPages.length) return window.__yomuPages;\n")
+		append("await new Promise(r => setTimeout(r, 220));\n")
+		append("}\n")
+		append("return null;\n")
 		append("}\n")
 		append("async function fetchChapter(id){\n")
 		append("try {\n")
@@ -914,26 +935,21 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val slugJson = JSONObject.quote(slug)
 		val numberJson = JSONObject.quote(chapterNumber)
 
-		// Restaurado do fluxo estável (2.0.60): espera fingerprint real, depois /api/chapters.
+		// Poll /api/chapters assim que o fingerprint liberar (sem wait fixo de 5.5s).
 		val landingScript = """
 			const knownId = $knownIdJson;
 			const slug = $slugJson;
 			const chapterNumber = $numberJson;
 			if (onLoginWall()) { finish({error:'auth'}); return; }
 			installPageHook();
-			const tryId = async (id) => {
-				if (!id) return null;
-				const data = await fetchChapter(id);
-				return pagesFromPayload(data);
-			};
 			const resolveId = async () => {
 				if (knownId) return knownId;
 				const target = Number(chapterNumber);
 				if (!slug || !Number.isFinite(target)) return '';
 				const titleHint = slug.replace(/-/g, ' ');
 				const urls = [
-					'/api/library?slug=' + encodeURIComponent(slug),
 					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
+					'/api/library?slug=' + encodeURIComponent(slug),
 				];
 				for (const url of urls) {
 					const data = await fetchJson(url);
@@ -954,19 +970,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				return '';
 			};
-			await waitForClient(5500);
-			let id = await resolveId();
-			for (let attempt = 0; attempt < 4; attempt++) {
-				const images = await tryId(id);
-				if (images) { finish(images); return; }
-				if (window.__yomuPages && window.__yomuPages.length) { finish(window.__yomuPages); return; }
-				await new Promise((r) => setTimeout(r, 400));
-				id = id || await resolveId();
+			let id = knownId || await resolveId();
+			let pages = await waitForChapterPages(id, 12000);
+			if (!pages && !id) {
+				id = await resolveId();
+				pages = await waitForChapterPages(id, 4000);
 			}
-			finish([]);
+			finish(pages || []);
 		""".trimIndent()
 		parsePagesJsResult(
-			evalYomuJs("https://$domain/", landingScript, timeout = 20000L),
+			evalYomuJs("https://$domain/", landingScript, timeout = 18000L),
 			"/ler/$slug/$chapterNumber",
 		)?.takeIf { it.isNotEmpty() }?.let { return it }
 
@@ -988,16 +1001,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
 				return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
 			};
-			await waitForClient(5500);
 			const knownId = $knownIdJson;
-			if (knownId) {
-				for (let attempt = 0; attempt < 4; attempt++) {
-					const pages = pagesFromPayload(await fetchChapter(knownId));
-					if (pages) { finish(pages); return; }
-					await new Promise((r) => setTimeout(r, 400));
-				}
-			}
-			for (let i = 0; i < 20; i++) {
+			let pages = knownId ? await waitForChapterPages(knownId, 8000) : null;
+			if (pages) { finish(pages); return; }
+			for (let i = 0; i < 16; i++) {
 				if (window.__yomuPages && window.__yomuPages.length) {
 					const real = window.__yomuPages.filter(isRealPage);
 					if (real.length > 1) { finish(real); return; }
@@ -1011,9 +1018,43 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			finish([]);
 		""".trimIndent()
 		return parsePagesJsResult(
-			evalYomuJs(chapterPath, chapterScript, timeout = 20000L),
+			evalYomuJs(chapterPath, chapterScript, timeout = 16000L),
 			chapterPath,
 		).orEmpty()
+	}
+
+	private fun rememberChapterIds(slug: String, ids: Map<String, String>) {
+		if (slug.isBlank() || ids.isEmpty()) return
+		synchronized(this) {
+			if (chapterIdCacheSlug == slug) {
+				chapterIdCache = chapterIdCache + ids
+			} else {
+				chapterIdCacheSlug = slug
+				chapterIdCache = ids.toMap()
+			}
+		}
+	}
+
+	private fun cachedChapterId(slug: String, number: String): String? {
+		val cache = synchronized(this) {
+			if (chapterIdCacheSlug == slug) chapterIdCache else emptyMap()
+		}
+		if (cache.isEmpty()) return null
+		cache[number]?.let { return it }
+		val asFloat = number.toFloatOrNull() ?: return null
+		return cache[chapterNumberKey(asFloat)]
+	}
+
+	private suspend fun resolveChapterId(slug: String, number: String): String? {
+		cachedChapterId(slug, number)?.let { return it }
+		val fromLibrary = runCatching {
+			fetchObraFromLibrary(slug, null)?.optJSONArray("recentChapters")
+				?.let(::parseChapterIdMapFromJsonArray)
+		}.getOrNull().orEmpty()
+		if (fromLibrary.isNotEmpty()) {
+			rememberChapterIds(slug, fromLibrary)
+		}
+		return cachedChapterId(slug, number)
 	}
 
 	private fun parsePagesJsResult(raw: String?, chapterUrl: String): List<MangaPage>? {
