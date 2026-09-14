@@ -145,9 +145,26 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val lastNumber = libraryLastChapterNumber(libraryObra)
 		val recentChapters = libraryObra?.optJSONArray("recentChapters")
 		val recentList = recentChapters?.let { mapRecentLibraryChapters(slug, it) }.orEmpty()
-		val apiChapters = fetchChaptersBySlug(slug, libraryObra?.getStringOrNull("id"))
-		val needJs = recentList.size < lastNumber.toInt().coerceAtLeast(1) &&
-			(apiChapters?.size ?: 0) < lastNumber.toInt().coerceAtLeast(1)
+		val apiChapters = libraryObra?.let { obra ->
+			val arr = obra.optJSONArray("chapters")
+				?: obra.optJSONArray("allChapters")
+				?: obra.optJSONArray("recentChapters")
+			arr?.let { mapGenericChapterArray(slug, it) }
+		}.orEmpty()
+		val idMap = LinkedHashMap<String, String>()
+		recentChapters?.let { recent ->
+			idMap.putAll(parseChapterIdMapFromJsonArray(recent))
+		}
+
+		// Monta a lista sem WebView primeiro — evita falhar/abrir lento em obras ok no proxy.
+		var chapters = mergeChapterList(
+			slug = slug,
+			parts = listOf(apiChapters, recentList),
+			idMap = idMap,
+			lastNumber = lastNumber,
+		)
+
+		val needJs = chapters.isEmpty()
 		val jsManga = if (needJs) {
 			runCatching { fetchDetailsViaJs(slug, manga) }.getOrNull()
 		} else {
@@ -171,10 +188,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				addAll(parseChaptersFromHtmlText(html, slug))
 			}
 		}
-		val idMap = LinkedHashMap<String, String>()
-		libraryObra?.optJSONArray("recentChapters")?.let { recent ->
-			idMap.putAll(parseChapterIdMapFromJsonArray(recent))
-		}
 		if (!html.isNullOrEmpty()) {
 			idMap.putAll(parseChapterIdMapFromHtml(html))
 		}
@@ -187,18 +200,20 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		} else {
 			parseChaptersFromRsc(rsc).filterNot { isTrapChapter(it) }
 		}
-		val chapters = mergeChapterList(
-			slug = slug,
-			parts = listOf(
-				apiChapters.orEmpty(),
-				jsManga?.chapters.orEmpty(),
-				htmlChapters,
-				rscChapters,
-				recentList,
-			),
-			idMap = idMap,
-			lastNumber = lastNumber,
-		)
+		if (needJs) {
+			chapters = mergeChapterList(
+				slug = slug,
+				parts = listOf(
+					apiChapters,
+					jsManga?.chapters.orEmpty(),
+					htmlChapters,
+					rscChapters,
+					recentList,
+				),
+				idMap = idMap,
+				lastNumber = maxOf(lastNumber, jsManga?.chapters?.maxOfOrNull { it.number } ?: 0f),
+			)
+		}
 
 		if (chapters.isEmpty()) {
 			jsManga?.takeIf { !it.chapters.isNullOrEmpty() }?.let { return it }
@@ -214,7 +229,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			?: pageMeta?.coverImage
 			?: jsManga?.coverUrl?.takeUnless { isTrapAsset(it) }
 			?: manga.coverUrl?.takeUnless { isTrapAsset(it) }
-		val description = if (isTrapPayload(rsc)) {
+		val description = if (html == null || isTrapPayload(rsc)) {
 			jsManga?.description?.takeUnless { isTrapDescription(it) }
 				?: manga.description?.takeUnless { isTrapDescription(it) }
 		} else {
@@ -224,8 +239,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				?: jsManga?.description?.takeUnless { isTrapDescription(it) }
 				?: manga.description?.takeUnless { isTrapDescription(it) }
 		}
-		val author = if (isTrapPayload(rsc)) null else extractJsonString(rsc, "author")
-		val artist = if (isTrapPayload(rsc)) null else extractJsonString(rsc, "artist")
+		val author = if (html == null || isTrapPayload(rsc)) null else extractJsonString(rsc, "author")
+		val artist = if (html == null || isTrapPayload(rsc)) null else extractJsonString(rsc, "artist")
 		val authors = buildSet {
 			author?.takeUnless { it.isBlank() }?.let(::add)
 			artist?.takeUnless { it.isBlank() || it == author }?.let(::add)
@@ -1227,9 +1242,14 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchObraFromLibrary(slug: String, title: String? = null): JSONObject? {
-		val queries = linkedSetOf(title?.trim(), slug.replace('-', ' '))
-			.filter { !it.isNullOrBlank() }
-			.filterNotNull()
+		val queries = LinkedHashSet<String>()
+		title?.trim()?.takeIf { it.isNotBlank() }?.let(queries::add)
+		val tokens = slug.split('-').filter { it.length >= 4 }
+		if (tokens.isNotEmpty()) {
+			queries.add(tokens.takeLast(minOf(3, tokens.size)).joinToString(" "))
+			tokens.sortedByDescending { it.length }.take(4).forEach(queries::add)
+		}
+		slug.replace('-', ' ').takeIf { it.isNotBlank() }?.let(queries::add)
 		for (query in queries) {
 			val encoded = query.urlEncoded().replace("+", "%20")
 			val json = runCatching {
@@ -1246,33 +1266,36 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	@Suppress("UNUSED_PARAMETER")
 	private suspend fun fetchChaptersBySlug(slug: String, seriesId: String?): List<MangaChapter>? {
 		// /api/library e /library/chapters exigem fingerprint e só atrasam (403).
-		// Usa só library-proxy por título/slug.
-		val queries = linkedSetOf(slug.replace('-', ' '), slug)
-		for (query in queries) {
-			val encoded = query.urlEncoded().replace("+", "%20")
-			val json = runCatching {
-				webClient.httpGet(
-					"https://$domain/api/library-proxy?search=$encoded&limit=20",
-					getApiHeaders(),
-				).parseJson()
-			}.getOrNull() ?: continue
-			val obra = findObraInLibraryResponse(json, slug) ?: continue
-			val arr = obra.optJSONArray("chapters")
-				?: obra.optJSONArray("allChapters")
-				?: obra.optJSONArray("recentChapters")
-				?: continue
-			val mapped = mapGenericChapterArray(slug, arr)
-			if (mapped.isNotEmpty()) return mapped
-		}
-		return null
+		val obra = fetchObraFromLibrary(slug, null) ?: return null
+		val arr = obra.optJSONArray("chapters")
+			?: obra.optJSONArray("allChapters")
+			?: obra.optJSONArray("recentChapters")
+			?: return null
+		val mapped = mapGenericChapterArray(slug, arr)
+		return mapped.takeIf { it.isNotEmpty() }
 	}
 
 	private fun findObraInLibraryResponse(json: JSONObject, slug: String): JSONObject? {
-		val arr = json.optLibraryArray() ?: return null
-		for (i in 0 until arr.length()) {
-			val obra = arr.optJSONObject(i) ?: continue
-			if (obra.optString("slug") == slug) {
-				return obra
+		val keys = listOf("catalogo", "garimpo", "prateleira", "acervo", "obras", "data", "series")
+		for (key in keys) {
+			val arr = json.optJSONArray(key) ?: continue
+			for (i in 0 until arr.length()) {
+				val obra = arr.optJSONObject(i) ?: continue
+				if (obra.optString("slug") == slug) {
+					return obra
+				}
+			}
+		}
+		json.optEncodedLibraryArray("catalogo")?.let { arr ->
+			for (i in 0 until arr.length()) {
+				val obra = arr.optJSONObject(i) ?: continue
+				if (obra.optString("slug") == slug) return obra
+			}
+		}
+		json.optEncodedLibraryArray("garimpo")?.let { arr ->
+			for (i in 0 until arr.length()) {
+				val obra = arr.optJSONObject(i) ?: continue
+				if (obra.optString("slug") == slug) return obra
 			}
 		}
 		return null
@@ -1459,7 +1482,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	private fun isTrapLibraryItem(obj: JSONObject): Boolean {
 		val slug = obj.getStringOrNull("slug").orEmpty()
-		if (slug.isBlank() || slug == "bloqueado" || slug.all { it.isDigit() }) return true
+		if (slug.isBlank() || slug == "bloqueado") return true
 		val type = obj.optString("type").lowercase(Locale.ROOT)
 		// Fonte de comics: novels quebram a lista (capa/fluxo diferente).
 		if (type == "novel" || type == "light-novel" || type == "lightnovel") return true
@@ -1721,15 +1744,14 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return null
 	}
 
-	private fun org.json.JSONObject.optLibraryArray(): org.json.JSONArray? =
-		optJSONArray("catalogo")
-			?: optJSONArray("garimpo")
-			?: optJSONArray("prateleira")
-			?: optJSONArray("acervo")
-			?: optJSONArray("obras")
-			?: optJSONArray("data")
-			?: optEncodedLibraryArray("catalogo")
+	private fun org.json.JSONObject.optLibraryArray(): org.json.JSONArray? {
+		for (key in listOf("catalogo", "garimpo", "prateleira", "acervo", "obras", "data", "series")) {
+			val arr = optJSONArray(key)
+			if (arr != null && arr.length() > 0) return arr
+		}
+		return optEncodedLibraryArray("catalogo")
 			?: optEncodedLibraryArray("garimpo")
+	}
 
 	private fun org.json.JSONObject.optEncodedLibraryArray(key: String): org.json.JSONArray? {
 		val encoded = optString(key).takeUnless { it.isBlank() } ?: return null
