@@ -43,6 +43,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	@Volatile
 	private var chapterIdCacheSlug: String? = null
 	private var chapterIdCache: Map<String, String> = emptyMap()
+	@Volatile
+	private var chapterIdMapFetchedSlug: String? = null
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -288,9 +290,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		} else {
 			super.getPageUrl(page)
 		}
-		// secure-image direto (com x-ym-media no interceptor) — evita hop extra do proxy-image.
-		if (url.startsWith("/")) {
-			return "https://$domain$url"
+		if (url.contains("/api/chapter/secure-image")) {
+			return "https://$domain/api/proxy-image?q=${url.urlEncoded()}"
 		}
 		return url
 	}
@@ -317,12 +318,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				changed = true
 			}
 		}
-		if (request.header("x-ym-media") == null) {
-			val mediaUrl = when {
-				path.contains("/api/proxy-image") -> url.queryParameter("q").orEmpty()
-				path.contains("/api/chapter/secure-image") -> url.toString()
-				else -> ""
-			}
+		if (path.contains("/api/proxy-image") && request.header("x-ym-media") == null) {
+			val mediaUrl = url.queryParameter("q").orEmpty()
 			if (mediaUrl.isNotEmpty()) {
 				builder.header("x-ym-media", buildYmMediaToken(mediaUrl))
 				changed = true
@@ -533,17 +530,6 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("await new Promise(r => setTimeout(r, 300));\n")
 		append("}\n")
 		append("return softOk;\n")
-		append("}\n")
-		append("async function waitForChapterPages(id, ms){\n")
-		append("if (!id) return null;\n")
-		append("const start = Date.now();\n")
-		append("while (Date.now() - start < ms) {\n")
-		append("const pages = pagesFromPayload(await fetchChapter(id));\n")
-		append("if (pages) return pages;\n")
-		append("if (window.__yomuPages && window.__yomuPages.length) return window.__yomuPages;\n")
-		append("await new Promise(r => setTimeout(r, 220));\n")
-		append("}\n")
-		append("return null;\n")
 		append("}\n")
 		append("async function fetchChapter(id){\n")
 		append("try {\n")
@@ -935,21 +921,26 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val slugJson = JSONObject.quote(slug)
 		val numberJson = JSONObject.quote(chapterNumber)
 
-		// Poll /api/chapters assim que o fingerprint liberar (sem wait fixo de 5.5s).
+		// Fluxo estável: fingerprint → resolve ID (caps sem ?id=) → /api/chapters.
 		val landingScript = """
 			const knownId = $knownIdJson;
 			const slug = $slugJson;
 			const chapterNumber = $numberJson;
 			if (onLoginWall()) { finish({error:'auth'}); return; }
 			installPageHook();
+			const tryId = async (id) => {
+				if (!id) return null;
+				return pagesFromPayload(await fetchChapter(id));
+			};
 			const resolveId = async () => {
 				if (knownId) return knownId;
 				const target = Number(chapterNumber);
 				if (!slug || !Number.isFinite(target)) return '';
 				const titleHint = slug.replace(/-/g, ' ');
 				const urls = [
-					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 					'/api/library?slug=' + encodeURIComponent(slug),
+					'/api/library/chapters?slug=' + encodeURIComponent(slug),
+					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
 				];
 				for (const url of urls) {
 					const data = await fetchJson(url);
@@ -970,16 +961,19 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				}
 				return '';
 			};
-			let id = knownId || await resolveId();
-			let pages = await waitForChapterPages(id, 12000);
-			if (!pages && !id) {
-				id = await resolveId();
-				pages = await waitForChapterPages(id, 4000);
+			await waitForClient(6000);
+			let id = await resolveId();
+			for (let attempt = 0; attempt < 6; attempt++) {
+				const images = await tryId(id);
+				if (images) { finish(images); return; }
+				if (window.__yomuPages && window.__yomuPages.length) { finish(window.__yomuPages); return; }
+				await new Promise((r) => setTimeout(r, 350));
+				id = id || await resolveId();
 			}
-			finish(pages || []);
+			finish([]);
 		""".trimIndent()
 		parsePagesJsResult(
-			evalYomuJs("https://$domain/", landingScript, timeout = 18000L),
+			evalYomuJs("https://$domain/", landingScript, timeout = 22000L),
 			"/ler/$slug/$chapterNumber",
 		)?.takeIf { it.isNotEmpty() }?.let { return it }
 
@@ -1001,10 +995,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (s.indexOf('/images/') >= 0 || s.indexOf('perfil') >= 0 || s.indexOf('yomu.png') >= 0) return false;
 				return s.indexOf('/chapters/') >= 0 || s.indexOf('secure-image') >= 0 || s.indexOf('proxy-image') >= 0;
 			};
+			await waitForClient(6000);
 			const knownId = $knownIdJson;
-			let pages = knownId ? await waitForChapterPages(knownId, 8000) : null;
-			if (pages) { finish(pages); return; }
-			for (let i = 0; i < 16; i++) {
+			if (knownId) {
+				for (let attempt = 0; attempt < 6; attempt++) {
+					const pages = pagesFromPayload(await fetchChapter(knownId));
+					if (pages) { finish(pages); return; }
+					await new Promise((r) => setTimeout(r, 350));
+				}
+			}
+			for (let i = 0; i < 24; i++) {
 				if (window.__yomuPages && window.__yomuPages.length) {
 					const real = window.__yomuPages.filter(isRealPage);
 					if (real.length > 1) { finish(real); return; }
@@ -1018,7 +1018,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			finish([]);
 		""".trimIndent()
 		return parsePagesJsResult(
-			evalYomuJs(chapterPath, chapterScript, timeout = 16000L),
+			evalYomuJs(chapterPath, chapterScript, timeout = 22000L),
 			chapterPath,
 		).orEmpty()
 	}
@@ -1053,8 +1053,69 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		}.getOrNull().orEmpty()
 		if (fromLibrary.isNotEmpty()) {
 			rememberChapterIds(slug, fromLibrary)
+			cachedChapterId(slug, number)?.let { return it }
+		}
+		// Caps antigos não vêm no recentChapters — busca mapa completo 1x por obra.
+		if (chapterIdMapFetchedSlug != slug) {
+			val fromJs = runCatching { fetchChapterIdMapViaJs(slug) }.getOrNull().orEmpty()
+			rememberChapterIds(slug, fromJs)
+			chapterIdMapFetchedSlug = slug
 		}
 		return cachedChapterId(slug, number)
+	}
+
+	private suspend fun fetchChapterIdMapViaJs(slug: String): Map<String, String> {
+		val slugJson = JSONObject.quote(slug)
+		val script = """
+			const slug = $slugJson;
+			if (onLoginWall()) { finish({error:'auth'}); return; }
+			const collect = (obra) => {
+				const arr = (obra && (obra.chapters || obra.allChapters || obra.capitulos || obra.recentChapters)) || [];
+				if (!Array.isArray(arr)) return [];
+				return arr.map((ch) => {
+					if (!ch) return null;
+					const number = ch.number ?? ch.num ?? ch.chapterNumber;
+					const id = ch.id || ch.chapterId;
+					if (number == null || !id || String(id).indexOf('fake') === 0) return null;
+					return { number: String(number), id: String(id) };
+				}).filter(Boolean);
+			};
+			await waitForClient(6000);
+			const titleHint = slug.replace(/-/g, ' ');
+			const urls = [
+				'/api/library?slug=' + encodeURIComponent(slug),
+				'/api/library/chapters?slug=' + encodeURIComponent(slug),
+				'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
+			];
+			let best = [];
+			for (const url of urls) {
+				const data = await fetchJson(url);
+				if (!data || data.error || data._xData) continue;
+				let entries = collect(data);
+				if (!entries.length) {
+					const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || [], data.obras || []);
+					const obra = pools.find((o) => o && o.slug === slug);
+					entries = collect(obra);
+				}
+				if (entries.length > best.length) best = entries;
+				if (best.length > 30) break;
+			}
+			finish({ entries: best });
+		""".trimIndent()
+		val raw = evalYomuJs("https://$domain/", script, timeout = 18000L) ?: return emptyMap()
+		val json = parseJsValue(raw) as? JSONObject ?: return emptyMap()
+		if (isAuthWall(json)) return emptyMap()
+		val entries = json.optJSONArray("entries") ?: return emptyMap()
+		val map = LinkedHashMap<String, String>()
+		for (i in 0 until entries.length()) {
+			val obj = entries.optJSONObject(i) ?: continue
+			val number = obj.optString("number")
+			val id = obj.optString("id")
+			if (number.isBlank() || id.isBlank() || isTrapChapterId(id)) continue
+			map[number] = id
+			number.toFloatOrNull()?.let { map.putIfAbsent(chapterNumberKey(it), id) }
+		}
+		return map
 	}
 
 	private fun parsePagesJsResult(raw: String?, chapterUrl: String): List<MangaPage>? {
