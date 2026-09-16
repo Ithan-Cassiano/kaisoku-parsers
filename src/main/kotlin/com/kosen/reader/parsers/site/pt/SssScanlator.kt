@@ -169,7 +169,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			lastNumber = lastNumber,
 		)
 
-		val needJs = chapters.isEmpty()
+		// Proxy só traz 3 recentes; se lastChapter/count falhar, a lista fica curta.
+		val needJs = chapters.size <= 3
 		val jsManga = if (needJs) {
 			runCatching { fetchDetailsViaJs(slug, manga) }.getOrNull()
 		} else {
@@ -788,33 +789,50 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			};
 			const collectFromObra = (obra) => {
 				if (!obra) return [];
-				return toEntries(obra.chapters || obra.allChapters || obra.capitulos || obra.recentChapters || []);
+				const arr = [obra.chapters, obra.allChapters, obra.capitulos, obra.recentChapters]
+					.find((x) => Array.isArray(x)) || [];
+				return toEntries(arr);
+			};
+			const chapterHigh = (obra) => {
+				if (!obra) return 0;
+				let n = 0;
+				const last = String(obra.lastChapter || '');
+				const nums = last.match(/(\d+(?:\.\d+)?)/g);
+				if (nums && nums.length) n = Math.max(n, Number(nums[nums.length - 1]) || 0);
+				if (typeof obra.chapters === 'number') n = Math.max(n, obra.chapters);
+				if (typeof obra.chapterTotal === 'number') n = Math.max(n, obra.chapterTotal);
+				if (typeof obra.totalChapters === 'number') n = Math.max(n, obra.totalChapters);
+				const rec = obra.recentChapters;
+				if (Array.isArray(rec)) {
+					for (const ch of rec) {
+						const num = Number(ch && (ch.number ?? ch.num ?? ch.chapterNumber));
+						if (Number.isFinite(num)) n = Math.max(n, num);
+					}
+				}
+				return n;
 			};
 			const fromApi = async () => {
 				const urls = [
-					'/api/library-proxy?slug=' + encodeURIComponent(slug),
-					'/api/library-proxy?search=' + encodeURIComponent(titleHint || slug.replace(/-/g, ' ')) + '&limit=20',
-					'/api/library-proxy?search=' + encodeURIComponent(slug) + '&limit=20',
+					'/api/library-proxy?search=' + encodeURIComponent(titleHint) + '&limit=20',
+					'/api/library-proxy?search=' + encodeURIComponent(slug.replace(/-/g, ' ')) + '&limit=20',
 				];
 				let best = [];
 				let title = '';
+				let total = 0;
 				for (const url of urls) {
+					if (!titleHint && url.indexOf('search=&') >= 0) continue;
 					const data = await fetchJson(url);
 					if (!data || data.error || data._xData) continue;
-					let entries = toEntries(data.chapters || data.allChapters || data.capitulos || data.data);
-					if (!entries.length && data.obras) entries = collectFromObra((data.obras.find && data.obras.find((o) => o && o.slug === slug)) || null);
-					if (!entries.length) {
-						const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || []);
-						const obra = pools.find((o) => o && o.slug === slug);
-						entries = collectFromObra(obra);
-						if (obra && obra.title) title = obra.title;
-					}
-					if (data.title) title = data.title;
+					const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || [], data.obras || []);
+					const obra = pools.find((o) => o && o.slug === slug) || (data.slug === slug ? data : null);
+					const entries = collectFromObra(obra);
+					if (obra && obra.title) title = obra.title;
+					total = Math.max(total, chapterHigh(obra));
 					if (entries.length > best.length) best = entries;
-					if (best.length > 5) break;
+					if (best.length > 5 && total > 3) break;
 				}
-				if (!best.length) return null;
-				return { title: title || '', entries: best, links: [], total: best.length };
+				if (!best.length && total <= 0) return null;
+				return { title: title || '', entries: best, links: [], total: total };
 			};
 			const parseHtml = (html) => {
 				if (!html) return { title: '', description: '', cover: '', links: [], entries: [], total: 0 };
@@ -839,15 +857,30 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					if (lm[1].indexOf(needle) >= 0) links.push(lm[1]);
 				}
 				const totalMatch = html.match(/chapterTotal["']?\s*[:=]\s*(\d+)/) || html.match(/"totalChapters"\s*:\s*(\d+)/);
-				return { title: '', description: '', cover: '', links: links, entries: entries, total: totalMatch ? parseInt(totalMatch[1], 10) : entries.length };
+				const lastMatch = html.match(/"lastChapter"\s*:\s*"Cap\.?\s*(\d+(?:\.\d+)?)/i) || html.match(/lastChapter["']?\s*[:=]\s*["']?Cap\.?\s*(\d+)/i);
+				const countMatch = html.match(/"chapters"\s*:\s*(\d+)/);
+				const total = Math.max(
+					totalMatch ? parseInt(totalMatch[1], 10) : 0,
+					lastMatch ? Number(lastMatch[1]) : 0,
+					countMatch ? parseInt(countMatch[1], 10) : 0,
+					entries.length,
+				);
+				return { title: '', description: '', cover: '', links: links, entries: entries, total: total };
 			};
 			const api = await fromApi();
-			if (api && api.entries.length > 2) { finish(api); return; }
 			const parsed = parseHtml(await fetchText('/obra/' + slug));
-			if (api && api.entries.length > parsed.entries.length) { finish(api); return; }
-			finish(parsed);
+			const total = Math.max((api && api.total) || 0, parsed.total || 0);
+			const entries = (api && api.entries && api.entries.length >= (parsed.entries || []).length)
+				? api.entries : (parsed.entries || []);
+			const links = (parsed.links && parsed.links.length) ? parsed.links : ((api && api.links) || []);
+			finish({
+				title: (api && api.title) || parsed.title || '',
+				entries: entries,
+				links: links,
+				total: total,
+			});
 		""".trimIndent()
-		val raw = evalYomuJs("https://$domain/", script, timeout = 8000L) ?: return null
+		val raw = evalYomuJs("https://$domain/obra/$slug", script, timeout = 14000L) ?: return null
 		val json = parseJsValue(raw) as? JSONObject ?: return null
 		if (isAuthWall(json)) return null
 		val found = LinkedHashMap<String, MangaChapter>()
@@ -890,7 +923,19 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			}
 		}
 		val chapters = found.values.sortedBy { it.number }
-		if (chapters.isEmpty()) return null
+		val total = json.optDouble("total", 0.0).toFloat()
+		val last = maxOf(total, chapters.maxOfOrNull { it.number } ?: 0f)
+		if (last >= 1f) {
+			val lastInt = last.toInt()
+			for (index in 1..lastInt) {
+				val key = index.toString()
+				if (!found.containsKey(key)) {
+					add(index.toFloat(), "/ler/$slug/$key")
+				}
+			}
+		}
+		val filled = found.values.sortedBy { it.number }
+		if (filled.isEmpty()) return null
 		val cover = json.getStringOrNull("cover")?.takeUnless { it.isBlank() || isTrapAsset(it) }
 		return manga.copy(
 			title = json.getStringOrNull("title")?.takeIf { it.isNotBlank() } ?: manga.title,
@@ -898,7 +943,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				?: manga.description,
 			coverUrl = cover ?: manga.coverUrl,
 			largeCoverUrl = cover ?: manga.largeCoverUrl,
-			chapters = chapters,
+			chapters = filled,
 		)
 	}
 
@@ -953,7 +998,8 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					if (!Array.isArray(arr) || !arr.length) {
 						const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || [], data.obras || []);
 						const obra = pools.find((o) => o && o.slug === slug);
-						arr = (obra && (obra.chapters || obra.allChapters || obra.recentChapters)) || [];
+						arr = [obra && obra.chapters, obra && obra.allChapters, obra && obra.recentChapters]
+							.find((x) => Array.isArray(x)) || [];
 					}
 					if (!Array.isArray(arr)) continue;
 					for (const ch of arr) {
@@ -1259,23 +1305,13 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchObraFromLibrary(slug: String, title: String? = null): JSONObject? {
-		val slugJson = runCatching {
-			webClient.httpGet(
-				"https://$domain/api/library-proxy?slug=${slug.urlEncoded()}",
-				getApiHeaders(),
-			).parseJson()
-		}.getOrNull()
-		if (slugJson != null) {
-			findObraInLibraryResponse(slugJson, slug)?.let { return it }
-			if (slugJson.optString("slug") == slug) return slugJson
-		}
-
 		val queries = LinkedHashSet<String>()
+		title?.trim()?.takeIf { it.isNotBlank() && !NUMERIC_TITLE_REGEX.matches(it) }?.let(queries::add)
 		slug.replace('-', ' ').takeIf { it.isNotBlank() }?.let(queries::add)
-		title?.trim()?.takeIf { it.isNotBlank() }?.let(queries::add)
 		val tokens = slug.split('-').filter { it.length >= 4 }
 		if (tokens.isNotEmpty()) {
 			queries.add(tokens.takeLast(minOf(3, tokens.size)).joinToString(" "))
+			tokens.sortedByDescending { it.length }.take(3).forEach(queries::add)
 		}
 		for (query in queries) {
 			val encoded = query.urlEncoded().replace("+", "%20")
@@ -1427,11 +1463,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 
 	private fun libraryLastChapterNumber(obj: JSONObject?): Float {
 		if (obj == null) return 0f
-		val fromLast = when (val value = obj.opt("lastChapter")) {
+		fun parseMarker(value: Any?): Float = when (value) {
 			is Number -> value.toFloat()
-			is String -> Regex("""(\d+(?:\.\d+)?)""").find(value)?.value?.toFloatOrNull() ?: 0f
+			is String -> Regex("""(\d+(?:\.\d+)?)""").findAll(value).lastOrNull()?.value?.toFloatOrNull() ?: 0f
 			else -> 0f
 		}
+		val fromLast = parseMarker(obj.opt("lastChapter"))
+		val fromCount = obj.opt("chapters").let { value ->
+			if (value is Number) value.toFloat() else 0f
+		}
+		val fromTotal = maxOf(parseMarker(obj.opt("chapterTotal")), parseMarker(obj.opt("totalChapters")))
 		var fromRecent = 0f
 		obj.optJSONArray("recentChapters")?.let { arr ->
 			for (i in 0 until arr.length()) {
@@ -1439,7 +1480,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				if (number > fromRecent) fromRecent = number
 			}
 		}
-		return maxOf(fromLast, fromRecent)
+		return maxOf(fromLast, fromCount, fromTotal, fromRecent)
 	}
 
 	private fun mergeChapterList(
