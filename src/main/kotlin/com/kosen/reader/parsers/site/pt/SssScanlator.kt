@@ -492,6 +492,11 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("window.__evaluateJsDone = (typeof value === 'string') ? value : JSON.stringify(value);\n")
 		append("} catch (e) { window.__evaluateJsDone = '[]'; }\n")
 		append("}\n")
+		// No Yomu 'chapters' as vezes e a contagem (numero), entao || pega o valor errado.
+		append("function pickArr(){\n")
+		append("for (var i = 0; i < arguments.length; i++) { if (Array.isArray(arguments[i])) return arguments[i]; }\n")
+		append("return [];\n")
+		append("}\n")
 		append("function onLoginWall(){\n")
 		append("const p = (location.pathname || '/').replace(/\\/+$/, '') || '/';\n")
 		append("return p === '/login' || p === '/registro';\n")
@@ -520,20 +525,21 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("return text;\n")
 		append("} catch (e) { return ''; }\n")
 		append("}\n")
+		// O Yomu esta atras do Cloudflare e bloqueia por volume: esperar o documento
+		// custa zero requisicao, e a sondagem fica limitada a 3 tentativas.
 		append("async function waitForClient(ms){\n")
 		append("const start = Date.now();\n")
-		append("let softOk = false;\n")
-		// library-proxy responde sem fingerprint; /api/chapters precisa do client real.
-		append("while (Date.now() - start < ms) {\n")
+		append("while (document.readyState !== 'complete' && Date.now() - start < ms) {\n")
+		append("await new Promise(r => setTimeout(r, 150));\n")
+		append("}\n")
+		append("await new Promise(r => setTimeout(r, 400));\n")
+		append("for (let i = 0; i < 3; i++) {\n")
 		append("const lib = await fetchJson('/api/library?page=1&limit=1&sort=updated');\n")
 		append("if (lib && !lib.error && !lib._xData) return true;\n")
-		append("const proxy = await fetchJson('/api/library-proxy?page=1&limit=1&sort=updated');\n")
-		append("if (proxy && (proxy.garimpo || proxy.catalogo || proxy.prateleira)) softOk = true;\n")
-		append("const probe = await fetchJson('/api/genres');\n")
-		append("if (probe) softOk = true;\n")
-		append("await new Promise(r => setTimeout(r, 300));\n")
+		append("if (Date.now() - start >= ms) break;\n")
+		append("await new Promise(r => setTimeout(r, 600));\n")
 		append("}\n")
-		append("return softOk;\n")
+		append("return true;\n")
 		append("}\n")
 		append("async function fetchChapter(id){\n")
 		append("try {\n")
@@ -803,7 +809,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			};
 			const collectFromObra = (obra) => {
 				if (!obra) return [];
-				return toEntries(obra.chapters || obra.allChapters || obra.capitulos || obra.recentChapters || []);
+				return toEntries(pickArr(obra.chapters, obra.allChapters, obra.capitulos, obra.recentChapters));
 			};
 			const fromApi = async () => {
 				const urls = [
@@ -818,7 +824,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				for (const url of urls) {
 					const data = await fetchJson(url);
 					if (!data || data.error || data._xData) continue;
-					let entries = toEntries(data.chapters || data.allChapters || data.capitulos || data.data);
+					let entries = toEntries(pickArr(data.chapters, data.allChapters, data.capitulos, data.data));
 					if (!entries.length && data.obras) entries = collectFromObra((data.obras.find && data.obras.find((o) => o && o.slug === slug)) || null);
 					if (!entries.length) {
 						const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || []);
@@ -949,11 +955,11 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				for (const url of urls) {
 					const data = await fetchJson(url);
 					if (!data || data.error || data._xData) continue;
-					let arr = data.chapters || data.allChapters || data.capitulos || data.data || [];
-					if (!Array.isArray(arr) || !arr.length) {
+					let arr = pickArr(data.chapters, data.allChapters, data.capitulos, data.data);
+					if (!arr.length) {
 						const pools = [].concat(data.garimpo || [], data.prateleira || [], data.acervo || [], data.catalogo || [], data.obras || []);
-						const obra = pools.find((o) => o && o.slug === slug);
-						arr = (obra && (obra.chapters || obra.allChapters || obra.recentChapters)) || [];
+						const obra = pools.find((o) => o && o.slug === slug) || (data.slug === slug ? data : null);
+						arr = obra ? pickArr(obra.chapters, obra.allChapters, obra.capitulos, obra.recentChapters) : [];
 					}
 					if (!Array.isArray(arr)) continue;
 					for (const ch of arr) {
@@ -1008,7 +1014,9 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					await new Promise((r) => setTimeout(r, 350));
 				}
 			}
-			for (let i = 0; i < 24; i++) {
+			// Sem id conhecido quem resolve o capitulo e a propria pagina do site,
+			// entao vale esperar ela renderizar em vez de insistir na API.
+			for (let i = 0; i < 44; i++) {
 				if (window.__yomuPages && window.__yomuPages.length) {
 					const real = window.__yomuPages.filter(isRealPage);
 					if (real.length > 1) { finish(real); return; }
@@ -1017,7 +1025,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					.map((img) => img.currentSrc || img.src || '')
 					.filter(isRealPage);
 				if (imgs.length > 1) { finish(imgs); return; }
-				await new Promise((r) => setTimeout(r, 250));
+				await new Promise((r) => setTimeout(r, 300));
 			}
 			finish([]);
 		""".trimIndent()
@@ -1074,7 +1082,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			const slug = $slugJson;
 			if (onLoginWall()) { finish({error:'auth'}); return; }
 			const collect = (obra) => {
-				const arr = (obra && (obra.chapters || obra.allChapters || obra.capitulos || obra.recentChapters)) || [];
+				const arr = obra ? pickArr(obra.chapters, obra.allChapters, obra.capitulos, obra.recentChapters) : [];
 				if (!Array.isArray(arr)) return [];
 				return arr.map((ch) => {
 					if (!ch) return null;
