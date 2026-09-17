@@ -43,6 +43,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	@Volatile
 	private var chapterIdCacheSlug: String? = null
 	private var chapterIdCache: Map<String, String> = emptyMap()
+
+	@Volatile
+	private var obraCacheSlug: String? = null
+	private var obraCache: JSONObject? = null
 	@Volatile
 	private var chapterIdMapFetchedSlug: String? = null
 
@@ -1344,15 +1348,12 @@ internal class SssScanlator(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchObraFromLibrary(slug: String, title: String? = null): JSONObject? {
+		synchronized(this) { if (obraCacheSlug == slug) obraCache else null }?.let { return it }
 		val queries = LinkedHashSet<String>()
 		title?.trim()?.takeIf { it.isNotBlank() }?.let(queries::add)
-		val tokens = slug.split('-').filter { it.length >= 4 }
-		if (tokens.isNotEmpty()) {
-			queries.add(tokens.takeLast(minOf(3, tokens.size)).joinToString(" "))
-			tokens.sortedByDescending { it.length }.take(4).forEach(queries::add)
-		}
 		slug.replace('-', ' ').takeIf { it.isNotBlank() }?.let(queries::add)
-		for (query in queries) {
+		// O Yomu fica atrás do Cloudflare e bloqueia por volume: no máximo duas buscas por obra.
+		for (query in queries.take(2)) {
 			val encoded = query.urlEncoded().replace("+", "%20")
 			val json = runCatching {
 				webClient.httpGet(
@@ -1360,7 +1361,13 @@ internal class SssScanlator(context: MangaLoaderContext) :
 					getApiHeaders(),
 				).parseJson()
 			}.getOrNull() ?: continue
-			findObraInLibraryResponse(json, slug)?.let { return it }
+			findObraInLibraryResponse(json, slug)?.let { obra ->
+				synchronized(this) {
+					obraCacheSlug = slug
+					obraCache = obra
+				}
+				return obra
+			}
 		}
 		return null
 	}
