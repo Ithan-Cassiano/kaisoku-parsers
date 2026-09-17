@@ -497,9 +497,13 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		append("for (var i = 0; i < arguments.length; i++) { if (Array.isArray(arguments[i])) return arguments[i]; }\n")
 		append("return [];\n")
 		append("}\n")
-		append("function onLoginWall(){\n")
+		// Visitante sem conta nao vai para /login: o Yomu devolve a landing. Se pedimos
+		// /ler/... e acabamos em outra rota, isso e muro de login, nao capitulo ausente.
+		append("function onLoginWall(expected){\n")
 		append("const p = (location.pathname || '/').replace(/\\/+$/, '') || '/';\n")
-		append("return p === '/login' || p === '/registro';\n")
+		append("if (p === '/login' || p === '/registro') return true;\n")
+		append("if (expected && p.indexOf(expected) !== 0) return true;\n")
+		append("return false;\n")
 		append("}\n")
 		append("function ymReq(id){\n")
 		append("const n = new Date();\n")
@@ -625,8 +629,11 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			?: runCatching { JSONObject(decoded) }.getOrNull()
 	}
 
-	private fun isAuthWall(value: Any?): Boolean =
-		(value as? JSONObject)?.optString("error") == "auth"
+	private fun isAuthWall(value: Any?): Boolean {
+		val error = (value as? JSONObject)?.optString("error") ?: return false
+		// /api/library responde {"error":"Forbidden"} quando nao ha sessao.
+		return error == "auth" || error.equals("Forbidden", ignoreCase = true)
+	}
 
 	private fun isFingerprintBlock(text: String): Boolean =
 		text.contains("Invalid browser fingerprint", ignoreCase = true) ||
@@ -995,7 +1002,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			"https://$domain/ler/$slug/$chapterNumber"
 		}
 		val chapterScript = """
-			if (onLoginWall()) { finish({error:'auth'}); return; }
+			if (onLoginWall('/ler/')) { finish({error:'auth'}); return; }
 			installPageHook();
 			const isRealPage = (u) => {
 				if (!u) return false;
@@ -1032,6 +1039,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return parsePagesJsResult(
 			evalYomuJs(chapterPath, chapterScript, timeout = 22000L),
 			chapterPath,
+			throwOnAuth = true,
 		).orEmpty()
 	}
 
@@ -1130,9 +1138,16 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		return map
 	}
 
-	private fun parsePagesJsResult(raw: String?, chapterUrl: String): List<MangaPage>? {
+	private fun parsePagesJsResult(
+		raw: String?,
+		chapterUrl: String,
+		throwOnAuth: Boolean = false,
+	): List<MangaPage>? {
 		val value = parseJsValue(raw ?: return null) ?: return null
-		if (isAuthWall(value)) return null
+		if (isAuthWall(value)) {
+			if (throwOnAuth) throw AuthRequiredException(source)
+			return null
+		}
 		if (value is JSONObject) {
 			val err = value.optString("error")
 			if (value.optBoolean("isLocked") || value.optString("lockedType").equals("VIP", true) ||
