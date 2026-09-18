@@ -175,7 +175,10 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			lastNumber = lastNumber,
 		)
 
-		val needJs = chapters.isEmpty()
+		// Placeholders sintéticos (1..lastNumber) sem id real não bastam: cada leitura
+		// teria que resolver o id na hora (endpoint com fingerprint, hoje instável).
+		// Sempre que existir capítulo sem id, busca a lista completa via WebView/HTML/RSC.
+		val needJs = chapters.isEmpty() || chapters.any { chapterApiId(it.url).isNullOrBlank() }
 		val jsManga = if (needJs) {
 			runCatching { fetchDetailsViaJs(slug, manga) }.getOrNull()
 		} else {
