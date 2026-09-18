@@ -290,6 +290,7 @@ internal class SssScanlator(context: MangaLoaderContext) :
 				.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		}
 		runCatching { fetchPagesViaJs(slug, number, chapterId) }
+			.onFailure { if (it is AuthRequiredException) throw it }
 			.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		if (slug.isNotEmpty() && number.isNotEmpty()) {
 			tryFetchTaurusPages(slug, number).takeIf { it.isNotEmpty() }?.let { return it }
@@ -1085,10 +1086,14 @@ internal class SssScanlator(context: MangaLoaderContext) :
 			cachedChapterId(slug, number)?.let { return it }
 		}
 		// Caps antigos não vêm no recentChapters — busca mapa completo 1x por obra.
+		// Só marca como "buscado" se realmente achou algo: falha passageira de
+		// WebView/fingerprint não pode travar a obra sem id pro resto da sessão.
 		if (chapterIdMapFetchedSlug != slug) {
 			val fromJs = runCatching { fetchChapterIdMapViaJs(slug) }.getOrNull().orEmpty()
-			rememberChapterIds(slug, fromJs)
-			chapterIdMapFetchedSlug = slug
+			if (fromJs.isNotEmpty()) {
+				rememberChapterIds(slug, fromJs)
+				chapterIdMapFetchedSlug = slug
+			}
 		}
 		return cachedChapterId(slug, number)
 	}
