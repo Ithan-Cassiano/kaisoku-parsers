@@ -285,17 +285,25 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		if (chapterId.isNullOrBlank() && slug.isNotEmpty() && number.isNotEmpty()) {
 			chapterId = resolveChapterId(slug, number)
 		}
+		// Guarda o erro mais específico visto entre as tentativas — se tudo falhar,
+		// mostrar "exclusivo para VIPs" ou o motivo real é bem mais útil do que um
+		// "não foi possível carregar" genérico que esconde a causa.
+		var lastError: String? = null
 		if (!chapterId.isNullOrBlank()) {
 			runCatching { fetchPagesFromApi("/api/chapters?id=$chapterId") }
+				.onFailure { e -> if (e is ParseException) lastError = e.shortMessage }
 				.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		}
 		runCatching { fetchPagesViaJs(slug, number, chapterId) }
-			.onFailure { if (it is AuthRequiredException) throw it }
+			.onFailure { e ->
+				if (e is AuthRequiredException) throw e
+				if (e is ParseException) lastError = e.shortMessage
+			}
 			.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
 		if (slug.isNotEmpty() && number.isNotEmpty()) {
 			tryFetchTaurusPages(slug, number).takeIf { it.isNotEmpty() }?.let { return it }
 		}
-		throw ParseException("Não foi possível carregar as páginas do capítulo", chapter.url)
+		throw ParseException(lastError ?: "Não foi possível carregar as páginas do capítulo", chapter.url)
 	}
 
 	override suspend fun getPageUrl(page: MangaPage): String {
