@@ -23,6 +23,7 @@ import com.kosen.reader.parsers.util.json.getStringOrNull
 import com.kosen.reader.parsers.util.json.mapJSON
 import com.kosen.reader.parsers.util.json.mapJSONNotNull
 import com.kosen.reader.parsers.util.suspendlazy.suspendLazy
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -187,7 +188,12 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		val needFullList = needJs && jsManga?.chapters.isNullOrEmpty()
 		val pageUrl = manga.url.toAbsoluteUrl(domain)
 		val html = if (needFullList) {
-			runCatching { fetchRawHtml(pageUrl) }.getOrNull()?.takeUnless { isFingerprintBlock(it) }
+			var raw = runCatching { fetchRawHtml(pageUrl) }.getOrNull()?.takeUnless { isFingerprintBlock(it) }
+			if (raw == null) {
+				delay(2000L)
+				raw = runCatching { fetchRawHtml(pageUrl) }.getOrNull()?.takeUnless { isFingerprintBlock(it) }
+			}
+			raw
 		} else {
 			null
 		}
@@ -1381,12 +1387,15 @@ internal class SssScanlator(context: MangaLoaderContext) :
 		// O Yomu fica atrás do Cloudflare e bloqueia por volume: no máximo duas buscas por obra.
 		for (query in queries.take(2)) {
 			val encoded = query.urlEncoded().replace("+", "%20")
-			val json = runCatching {
-				webClient.httpGet(
-					"https://$domain/api/library-proxy?search=$encoded&limit=20",
-					getApiHeaders(),
-				).parseJson()
-			}.getOrNull() ?: continue
+			val url = "https://$domain/api/library-proxy?search=$encoded&limit=20"
+			var json = runCatching { webClient.httpGet(url, getApiHeaders()).parseJson() }.getOrNull()
+			if (json == null) {
+				// Bloqueio de fingerprint costuma ser um pico curto de rate-limit; uma
+				// segunda tentativa depois de uma pausa às vezes já passa.
+				delay(2000L)
+				json = runCatching { webClient.httpGet(url, getApiHeaders()).parseJson() }.getOrNull()
+			}
+			json ?: continue
 			findObraInLibraryResponse(json, slug)?.let { obra ->
 				synchronized(this) {
 					obraCacheSlug = slug
